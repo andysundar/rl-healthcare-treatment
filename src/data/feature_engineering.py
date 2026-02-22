@@ -1,0 +1,707 @@
+"""
+Feature Engineering Module for Healthcare RL
+
+This module extracts and engineers features from raw clinical data:
+- Demographics with categorical age bucketing
+- Vital signs sequences
+- Laboratory values sequences
+- Medication history encoding
+- Temporal features (time gaps, trends, seasonality)
+- Comorbidity encoding from ICD-9 codes
+
+Author: Anindya Bandopadhyay (M23CSA508)
+Date: January 2026
+"""
+
+import logging
+from datetime import datetime
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class AgeBucket(Enum):
+    """Age categories for patient stratification."""
+    NEONATE = "neonate"  # 0-28 days
+    INFANT = "infant"  # 29 days - 1 year
+    CHILD = "child"  # 1-12 years
+    ADOLESCENT = "adolescent"  # 13-18 years
+    YOUNG_ADULT = "young_adult"  # 19-35 years
+    ADULT = "adult"  # 36-60 years
+    ELDERLY = "elderly"  # 61-80 years
+    VERY_ELDERLY = "very_elderly"  # 80+ years
+
+
+class AgeBucketing:
+    """
+    Single source of truth for age bucketing in MIMIC-III data.
+    
+    Handles privacy-shifted birth dates and provides categorical age groups
+    that are clinically meaningful and avoid datetime overflow errors.
+    """
+    
+    @staticmethod
+    def get_age_bucket(age_years: float) -> AgeBucket:
+        """
+        Convert age in years to categorical age bucket.
+        
+        Args:
+            age_years: Age in years (can be fractional for infants)
+            
+        Returns:
+            AgeBucket enum value
+        """
+        if age_years < 0:
+            logger.warning(f"Negative age: {age_years}, treating as 0")
+            age_years = 0
+        
+        if age_years < 0.077:  # ~28 days
+            return AgeBucket.NEONATE
+        elif age_years < 1:
+            return AgeBucket.INFANT
+        elif age_years < 12:
+            return AgeBucket.CHILD
+        elif age_years < 18:
+            return AgeBucket.ADOLESCENT
+        elif age_years < 35:
+            return AgeBucket.YOUNG_ADULT
+        elif age_years < 60:
+            return AgeBucket.ADULT
+        elif age_years < 80:
+            return AgeBucket.ELDERLY
+        else:
+            return AgeBucket.VERY_ELDERLY
+    
+    @staticmethod
+    def calculate_age_at_admission(
+        dob: pd.Timestamp,
+        admittime: pd.Timestamp,
+        handle_privacy_shift: bool = True
+    ) -> float:
+        """
+        Calculate age at admission handling MIMIC-III privacy shifts.
+        
+        Args:
+            dob: Date of birth (privacy-shifted in MIMIC-III)
+            admittime: Admission timestamp
+            handle_privacy_shift: If True, handles MIMIC-III privacy shift (~300 years)
+            
+        Returns:
+            Age in years
+            
+        Note:
+            MIMIC-III shifts DOB by ~300 years for patients >89 to protect privacy.
+            This function detects and corrects for this shift.
+        """
+        try:
+            age_timedelta = admittime - dob
+            age_years = age_timedelta.days / 365.25
+            
+            # Handle MIMIC-III privacy shift
+            if handle_privacy_shift and age_years > 200:
+                # Privacy-shifted - patient is >89
+                # Assign median age for very elderly
+                age_years = 91.5
+                logger.debug(f"Privacy-shifted age detected, using {age_years}")
+            
+            # Handle negative ages (data error)
+            if age_years < 0:
+                logger.warning(f"Negative age calculated: {age_years}, using 0")
+                age_years = 0
+            
+            return age_years
+            
+        except Exception as e:
+            logger.error(f"Error calculating age: {e}")
+            return 0.0
+    
+    @staticmethod
+    def bucket_to_numeric(bucket: AgeBucket) -> int:
+        """Convert age bucket to numeric value for modeling."""
+        bucket_order = {
+            AgeBucket.NEONATE: 0,
+            AgeBucket.INFANT: 1,
+            AgeBucket.CHILD: 2,
+            AgeBucket.ADOLESCENT: 3,
+            AgeBucket.YOUNG_ADULT: 4,
+            AgeBucket.ADULT: 5,
+            AgeBucket.ELDERLY: 6,
+            AgeBucket.VERY_ELDERLY: 7
+        }
+        return bucket_order[bucket]
+    
+    @staticmethod
+    def bucket_to_onehot(bucket: AgeBucket) -> np.ndarray:
+        """Convert age bucket to one-hot encoding."""
+        buckets = list(AgeBucket)
+        onehot = np.zeros(len(buckets))
+        onehot[buckets.index(bucket)] = 1
+        return onehot
+
+
+class FeatureEngineer:
+    """
+    Extract and engineer features from raw clinical data.
+    
+    Provides methods for:
+    - Demographics extraction with categorical age bucketing
+    - Vital signs sequence extraction
+    - Laboratory values sequence extraction
+    - Medication history encoding
+    - Temporal feature engineering
+    - Comorbidity encoding from ICD-9 codes
+    
+    Example:
+        >>> engineer = FeatureEngineer()
+        >>> demographics = engineer.extract_demographics(patients, admissions)
+        >>> vitals_seq = engineer.extract_vitals_sequence(admissions, chartevents)
+    """
+    
+    # Common ICD-9 codes for chronic diseases
+    CHRONIC_CONDITIONS = {
+        'diabetes': ['250'],  # Diabetes mellitus
+        'hypertension': ['401', '402', '403', '404', '405'],
+        'heart_disease': ['410', '411', '412', '413', '414'],
+        'copd': ['491', '492', '496'],
+        'ckd': ['585', '586'],  # Chronic kidney disease
+        'heart_failure': ['428'],
+        'stroke': ['430', '431', '432', '433', '434', '435', '436'],
+        'cancer': ['140', '141', '142', '143', '144', '145', '146', '147', '148', '149',
+                  '150', '151', '152', '153', '154', '155', '156', '157', '158', '159'],
+    }
+    
+    def __init__(self):
+        """Initialize feature engineer."""
+        self.label_encoders: Dict[str, LabelEncoder] = {}
+        self.age_bucketing = AgeBucketing()
+        logger.info("Initialized FeatureEngineer")
+    
+    def extract_demographics(
+        self,
+        patients: pd.DataFrame,
+        admissions: Optional[pd.DataFrame] = None,
+        reference_time: Optional[pd.Timestamp] = None
+    ) -> pd.DataFrame:
+        """
+        Extract demographic features from patient data.
+        
+        Args:
+            patients: PATIENTS table DataFrame
+            admissions: ADMISSIONS table DataFrame (optional, for age at admission)
+            reference_time: Reference time for age calculation (default: now)
+            
+        Returns:
+            DataFrame with demographic features:
+            - subject_id: Patient identifier
+            - gender: Gender (M/F)
+            - gender_encoded: Numeric encoding (0/1)
+            - age_years: Age in years
+            - age_bucket: Categorical age group
+            - age_bucket_numeric: Numeric age bucket (0-7)
+            - age_bucket_onehot: One-hot encoded age (8 columns)
+            - ethnicity: Ethnicity (if available from admissions)
+            - ethnicity_encoded: Numeric encoding
+            - is_deceased: Boolean flag
+            
+        Note:
+            Uses AgeBucketing class as single source of truth for age categories
+        """
+        logger.info(f"Extracting demographics for {len(patients)} patients")
+        
+        demo_features = pd.DataFrame()
+        demo_features['subject_id'] = patients['subject_id']
+        
+        # Gender
+        demo_features['gender'] = patients['gender']
+        if 'gender' not in self.label_encoders:
+            self.label_encoders['gender'] = LabelEncoder()
+            self.label_encoders['gender'].fit(['M', 'F'])
+        demo_features['gender_encoded'] = self.label_encoders['gender'].transform(
+            demo_features['gender'].fillna('M')
+        )
+        
+        # Age calculation
+        if reference_time is None:
+            reference_time = pd.Timestamp.now()
+        
+        if admissions is not None:
+            # Calculate age at first admission
+            first_admissions = admissions.groupby('subject_id')['admittime'].min().reset_index()
+            demo_features = demo_features.merge(first_admissions, on='subject_id', how='left')
+            
+            # Merge with patients to get DOB
+            demo_features = demo_features.merge(
+                patients[['subject_id', 'dob']],
+                on='subject_id',
+                how='left'
+            )
+            
+            # Calculate age at admission
+            demo_features['age_years'] = demo_features.apply(
+                lambda row: self.age_bucketing.calculate_age_at_admission(
+                    row['dob'], row['admittime']
+                ) if pd.notna(row['admittime']) else np.nan,
+                axis=1
+            )
+        else:
+            # Calculate current age
+            demo_features = demo_features.merge(
+                patients[['subject_id', 'dob']],
+                on='subject_id',
+                how='left'
+            )
+            
+            demo_features['age_years'] = demo_features['dob'].apply(
+                lambda dob: self.age_bucketing.calculate_age_at_admission(
+                    dob, reference_time
+                ) if pd.notna(dob) else np.nan
+            )
+        
+        # Age bucketing
+        demo_features['age_bucket'] = demo_features['age_years'].apply(
+            lambda age: self.age_bucketing.get_age_bucket(age).value 
+            if pd.notna(age) else AgeBucket.ADULT.value
+        )
+        
+        demo_features['age_bucket_numeric'] = demo_features['age_years'].apply(
+            lambda age: self.age_bucketing.bucket_to_numeric(
+                self.age_bucketing.get_age_bucket(age)
+            ) if pd.notna(age) else 5  # Default to ADULT
+        )
+        
+        # One-hot encode age buckets
+        age_buckets = [bucket.value for bucket in AgeBucket]
+        for i, bucket in enumerate(age_buckets):
+            demo_features[f'age_bucket_{bucket}'] = (
+                demo_features['age_bucket'] == bucket
+            ).astype(int)
+        
+        # Mortality
+        demo_features = demo_features.merge(
+            patients[['subject_id', 'dod']],
+            on='subject_id',
+            how='left',
+            suffixes=('', '_patient')
+        )
+        demo_features['is_deceased'] = demo_features['dod'].notna().astype(int)
+        
+        # Ethnicity (if admissions available)
+        if admissions is not None and 'ethnicity' in admissions.columns:
+            ethnicity = admissions.groupby('subject_id')['ethnicity'].first().reset_index()
+            demo_features = demo_features.merge(ethnicity, on='subject_id', how='left')
+            
+            # Encode ethnicity
+            if 'ethnicity' not in self.label_encoders:
+                self.label_encoders['ethnicity'] = LabelEncoder()
+                unique_ethnicities = demo_features['ethnicity'].dropna().unique()
+                self.label_encoders['ethnicity'].fit(unique_ethnicities)
+            
+            demo_features['ethnicity_encoded'] = self.label_encoders['ethnicity'].transform(
+                demo_features['ethnicity'].fillna('UNKNOWN')
+            )
+        
+        # Clean up temporary columns
+        cols_to_drop = ['dob', 'admittime', 'dod']
+        demo_features = demo_features.drop(
+            columns=[c for c in cols_to_drop if c in demo_features.columns]
+        )
+        
+        logger.info(f"Extracted {len(demo_features.columns)} demographic features")
+        return demo_features
+    
+    def extract_vitals_sequence(
+        self,
+        chartevents: pd.DataFrame,
+        subject_ids: Optional[List[int]] = None,
+        vital_itemids: Optional[Dict[str, List[int]]] = None
+    ) -> pd.DataFrame:
+        """
+        Extract vital signs sequences from CHARTEVENTS.
+        
+        Args:
+            chartevents: CHARTEVENTS DataFrame
+            subject_ids: Filter for specific patients
+            vital_itemids: Mapping of vital names to MIMIC item IDs
+                         Example: {'heart_rate': [211, 220045], 'sbp': [51, 220050]}
+            
+        Returns:
+            DataFrame with vital signs sequences
+            
+        Note:
+            Default vital_itemids for common vitals are used if not specified
+        """
+        logger.info("Extracting vital signs sequences")
+        
+        # Default MIMIC-III item IDs for common vitals
+        if vital_itemids is None:
+            vital_itemids = {
+                'heart_rate': [211, 220045],
+                'sbp': [51, 442, 455, 6701, 220050, 220179],
+                'dbp': [8368, 8440, 8441, 8555, 220051, 220180],
+                'temperature': [223761, 678],
+                'respiratory_rate': [618, 615, 220210, 224690],
+                'spo2': [646, 220277],
+            }
+        
+        # Filter by subject_ids if provided
+        if subject_ids is not None:
+            chartevents = chartevents[chartevents['subject_id'].isin(subject_ids)]
+        
+        vitals_list = []
+        
+        for vital_name, itemids in vital_itemids.items():
+            # Extract vital
+            vital_data = chartevents[chartevents['itemid'].isin(itemids)].copy()
+            
+            if len(vital_data) == 0:
+                continue
+            
+            # Use numeric value
+            vital_data = vital_data[['subject_id', 'hadm_id', 'charttime', 'valuenum']].copy()
+            vital_data = vital_data.dropna(subset=['valuenum'])
+            vital_data = vital_data.rename(columns={'valuenum': vital_name})
+            
+            vitals_list.append(vital_data)
+            logger.info(f"Extracted {len(vital_data)} {vital_name} measurements")
+        
+        if not vitals_list:
+            logger.warning("No vital signs found")
+            return pd.DataFrame()
+        
+        # Merge all vitals on timestamp
+        vitals = vitals_list[0]
+        for vital_df in vitals_list[1:]:
+            vitals = vitals.merge(
+                vital_df,
+                on=['subject_id', 'hadm_id', 'charttime'],
+                how='outer'
+            )
+        
+        # Sort by time
+        vitals = vitals.sort_values(['subject_id', 'hadm_id', 'charttime'])
+        
+        logger.info(f"Created vitals sequence with {len(vitals)} timepoints")
+        return vitals
+    
+    def extract_lab_sequence(
+        self,
+        labevents: pd.DataFrame,
+        subject_ids: Optional[List[int]] = None,
+        lab_itemids: Optional[Dict[str, List[int]]] = None
+    ) -> pd.DataFrame:
+        """
+        Extract laboratory values sequences from LABEVENTS.
+        
+        Args:
+            labevents: LABEVENTS DataFrame
+            subject_ids: Filter for specific patients
+            lab_itemids: Mapping of lab names to MIMIC item IDs
+            
+        Returns:
+            DataFrame with lab values sequences
+        """
+        logger.info("Extracting laboratory sequences")
+        
+        # Default MIMIC-III item IDs for common labs
+        if lab_itemids is None:
+            lab_itemids = {
+                'glucose': [50809, 50931],
+                'sodium': [50824, 50983],
+                'potassium': [50822, 50971],
+                'chloride': [50806, 50902],
+                'bicarbonate': [50803, 50882],
+                'bun': [51006],
+                'creatinine': [50912],
+                'hematocrit': [51221, 50810],
+                'wbc': [51300, 51301],
+                'hemoglobin': [51222, 50811],
+                'platelet': [51265],
+            }
+        
+        # Filter by subject_ids if provided
+        if subject_ids is not None:
+            labevents = labevents[labevents['subject_id'].isin(subject_ids)]
+        
+        labs_list = []
+        
+        for lab_name, itemids in lab_itemids.items():
+            # Extract lab
+            lab_data = labevents[labevents['itemid'].isin(itemids)].copy()
+            
+            if len(lab_data) == 0:
+                continue
+            
+            # Use numeric value
+            lab_data = lab_data[['subject_id', 'hadm_id', 'charttime', 'valuenum']].copy()
+            lab_data = lab_data.dropna(subset=['valuenum'])
+            lab_data = lab_data.rename(columns={'valuenum': lab_name})
+            
+            labs_list.append(lab_data)
+            logger.info(f"Extracted {len(lab_data)} {lab_name} measurements")
+        
+        if not labs_list:
+            logger.warning("No lab values found")
+            return pd.DataFrame()
+        
+        # Merge all labs on timestamp
+        labs = labs_list[0]
+        for lab_df in labs_list[1:]:
+            labs = labs.merge(
+                lab_df,
+                on=['subject_id', 'hadm_id', 'charttime'],
+                how='outer'
+            )
+        
+        # Sort by time
+        labs = labs.sort_values(['subject_id', 'hadm_id', 'charttime'])
+        
+        logger.info(f"Created labs sequence with {len(labs)} timepoints")
+        return labs
+    
+    def extract_medication_history(
+        self,
+        prescriptions: pd.DataFrame,
+        encoding: str = 'binary'
+    ) -> pd.DataFrame:
+        """
+        Extract medication history and encode.
+        
+        Args:
+            prescriptions: PRESCRIPTIONS DataFrame
+            encoding: Encoding method - 'binary', 'count', or 'frequency'
+            
+        Returns:
+            DataFrame with encoded medication history
+        """
+        logger.info(f"Extracting medication history with {encoding} encoding")
+        
+        # Get unique medications per patient
+        med_by_patient = prescriptions.groupby(['subject_id', 'drug']).size().reset_index(name='count')
+        
+        if encoding == 'binary':
+            # Binary: whether patient has taken the medication
+            med_pivot = med_by_patient.pivot_table(
+                index='subject_id',
+                columns='drug',
+                values='count',
+                fill_value=0
+            )
+            med_pivot = (med_pivot > 0).astype(int)
+        
+        elif encoding == 'count':
+            # Count: number of times medication was prescribed
+            med_pivot = med_by_patient.pivot_table(
+                index='subject_id',
+                columns='drug',
+                values='count',
+                fill_value=0
+            )
+        
+        elif encoding == 'frequency':
+            # Frequency: proportion of admissions with medication
+            admissions_per_patient = prescriptions.groupby('subject_id')['hadm_id'].nunique()
+            med_pivot = med_by_patient.pivot_table(
+                index='subject_id',
+                columns='drug',
+                values='count',
+                fill_value=0
+            )
+            med_pivot = med_pivot.div(admissions_per_patient, axis=0)
+        
+        else:
+            raise ValueError(f"Invalid encoding: {encoding}")
+        
+        # Reset index
+        med_pivot = med_pivot.reset_index()
+        
+        # Rename columns for clarity
+        med_pivot.columns = ['subject_id'] + [f'med_{col}' for col in med_pivot.columns[1:]]
+        
+        logger.info(f"Encoded {len(med_pivot.columns)-1} unique medications")
+        return med_pivot
+    
+    def create_temporal_features(
+        self,
+        df: pd.DataFrame,
+        time_column: str = 'charttime',
+        subject_column: str = 'subject_id'
+    ) -> pd.DataFrame:
+        """
+        Create temporal features from time-series data.
+        
+        Args:
+            df: Input DataFrame with timestamps
+            time_column: Name of timestamp column
+            subject_column: Name of patient ID column
+            
+        Returns:
+            DataFrame with additional temporal features:
+            - time_since_last: Time since previous measurement (hours)
+            - time_of_day: Hour of day (0-23)
+            - day_of_week: Day of week (0-6)
+            - is_weekend: Weekend indicator
+            - is_night: Night time indicator (22:00-06:00)
+            - rolling_mean_*: Rolling mean of numeric features
+            - rolling_std_*: Rolling standard deviation
+            - trend_*: Recent trend (difference from previous value)
+        """
+        logger.info("Creating temporal features")
+        
+        df_temporal = df.copy()
+        
+        # Ensure datetime
+        if not pd.api.types.is_datetime64_any_dtype(df_temporal[time_column]):
+            df_temporal[time_column] = pd.to_datetime(df_temporal[time_column])
+        
+        # Sort by subject and time
+        df_temporal = df_temporal.sort_values([subject_column, time_column])
+        
+        # Time since last measurement
+        df_temporal['time_since_last'] = df_temporal.groupby(subject_column)[time_column].diff()
+        df_temporal['time_since_last_hours'] = df_temporal['time_since_last'].dt.total_seconds() / 3600
+        
+        # Time of day features
+        df_temporal['time_of_day'] = df_temporal[time_column].dt.hour
+        df_temporal['day_of_week'] = df_temporal[time_column].dt.dayofweek
+        df_temporal['is_weekend'] = (df_temporal['day_of_week'] >= 5).astype(int)
+        df_temporal['is_night'] = ((df_temporal['time_of_day'] >= 22) | 
+                                    (df_temporal['time_of_day'] <= 6)).astype(int)
+        
+        # Rolling statistics for numeric columns
+        numeric_cols = df_temporal.select_dtypes(include=[np.number]).columns
+        numeric_cols = [c for c in numeric_cols if c not in [subject_column, 'time_of_day', 
+                                                               'day_of_week', 'is_weekend', 'is_night']]
+        
+        for col in numeric_cols:
+            # 3-point rolling mean
+            df_temporal[f'rolling_mean_{col}'] = df_temporal.groupby(subject_column)[col].transform(
+                lambda x: x.rolling(window=3, min_periods=1).mean()
+            )
+            
+            # 3-point rolling std
+            df_temporal[f'rolling_std_{col}'] = df_temporal.groupby(subject_column)[col].transform(
+                lambda x: x.rolling(window=3, min_periods=1).std()
+            )
+            
+            # Trend (difference from previous)
+            df_temporal[f'trend_{col}'] = df_temporal.groupby(subject_column)[col].diff()
+        
+        # Drop intermediate columns
+        df_temporal = df_temporal.drop(columns=['time_since_last'])
+        
+        logger.info(f"Created {len(df_temporal.columns) - len(df.columns)} temporal features")
+        return df_temporal
+    
+    def encode_comorbidities(
+        self,
+        diagnoses: pd.DataFrame,
+        conditions: Optional[Dict[str, List[str]]] = None
+    ) -> pd.DataFrame:
+        """
+        Encode comorbidities from ICD-9 diagnosis codes.
+        
+        Args:
+            diagnoses: DIAGNOSES_ICD DataFrame
+            conditions: Dict mapping condition names to ICD-9 code prefixes
+                       (None = use default chronic conditions)
+            
+        Returns:
+            DataFrame with binary indicators for each condition
+        """
+        logger.info("Encoding comorbidities from ICD-9 codes")
+        
+        if conditions is None:
+            conditions = self.CHRONIC_CONDITIONS
+        
+        # Initialize result
+        comorbidity_features = pd.DataFrame()
+        comorbidity_features['subject_id'] = diagnoses['subject_id'].unique()
+        
+        # Check each condition
+        for condition_name, icd_prefixes in conditions.items():
+            # Find patients with this condition
+            has_condition = diagnoses[
+                diagnoses['icd9_code'].str.startswith(tuple(icd_prefixes), na=False)
+            ]['subject_id'].unique()
+            
+            # Create binary indicator
+            comorbidity_features[f'has_{condition_name}'] = comorbidity_features['subject_id'].isin(
+                has_condition
+            ).astype(int)
+            
+            logger.info(f"{condition_name}: {len(has_condition)} patients")
+        
+        # Count total comorbidities
+        condition_cols = [c for c in comorbidity_features.columns if c.startswith('has_')]
+        comorbidity_features['total_comorbidities'] = comorbidity_features[condition_cols].sum(axis=1)
+        
+        logger.info(f"Encoded {len(condition_cols)} comorbidities")
+        return comorbidity_features
+
+
+if __name__ == '__main__':
+    # Example usage
+    
+    # Create sample patient data
+    sample_patients = pd.DataFrame({
+        'subject_id': [1, 2, 3, 4, 5],
+        'gender': ['M', 'F', 'M', 'F', 'M'],
+        'dob': pd.to_datetime(['1950-01-01', '1985-05-15', '2010-12-01', 
+                               '1960-03-20', '1945-11-10']),
+        'dod': [pd.NaT, pd.NaT, pd.NaT, pd.NaT, pd.Timestamp('2020-01-01')]
+    })
+    
+    sample_admissions = pd.DataFrame({
+        'subject_id': [1, 1, 2, 3, 4, 5],
+        'hadm_id': [100, 101, 102, 103, 104, 105],
+        'admittime': pd.to_datetime(['2020-01-01', '2020-06-01', '2020-02-01',
+                                     '2020-03-01', '2020-04-01', '2019-12-01']),
+        'ethnicity': ['WHITE', 'WHITE', 'ASIAN', 'HISPANIC', 'BLACK', 'WHITE']
+    })
+    
+    # Initialize engineer
+    engineer = FeatureEngineer()
+    
+    print("=== Demographics Extraction ===")
+    demographics = engineer.extract_demographics(sample_patients, sample_admissions)
+    print(demographics)
+    
+    print("\n=== Age Bucketing Examples ===")
+    for age in [0.01, 0.5, 5, 15, 25, 45, 70, 85]:
+        bucket = engineer.age_bucketing.get_age_bucket(age)
+        print(f"Age {age}: {bucket.value}")
+    
+    # Create sample temporal data
+    sample_vitals = pd.DataFrame({
+        'subject_id': [1, 1, 1, 2, 2, 2],
+        'hadm_id': [100, 100, 100, 102, 102, 102],
+        'charttime': pd.date_range('2020-01-01', periods=6, freq='H')[:6],
+        'heart_rate': [75, 80, 78, 85, 90, 88],
+        'sbp': [120, 125, 122, 130, 135, 132]
+    })
+    
+    print("\n=== Temporal Features ===")
+    temporal_features = engineer.create_temporal_features(sample_vitals)
+    print(temporal_features[['subject_id', 'charttime', 'time_since_last_hours', 
+                             'time_of_day', 'is_night']].head())
+    
+    # Sample diagnoses
+    sample_diagnoses = pd.DataFrame({
+        'subject_id': [1, 1, 2, 3, 4],
+        'hadm_id': [100, 100, 102, 103, 104],
+        'icd9_code': ['25000', '40100', '25010', '41000', '4280']
+    })
+    
+    print("\n=== Comorbidity Encoding ===")
+    comorbidities = engineer.encode_comorbidities(sample_diagnoses)
+    print(comorbidities)

@@ -1,0 +1,35 @@
+# Core runtime dependencies for rl-healthcare-treatment
+# Use conservative minimum versions compatible with Python >=3.8
+
+numpy>=1.21
+pandas>=1.4
+scipy>=1.8
+scikit-learn>=1.0
+PyYAML>=6.0
+matplotlib>=3.5
+seaborn>=0.12
+gymnasium>=0.28
+torch>=2.0
+tqdm>=4.64
+pyarrow>=8.0
+
+# Optional / extras (used in examples, training utilities, or for faster workflows)
+# Install individually if required:
+# - Experiment tracking & logging
+mlflow>=2.0  # optional
+wandb>=0.15  # optional
+
+# RL tooling (optional)
+# stable-baselines3 provides RL algorithms used in some examples
+stable-baselines3>=2.0  # optional
+
+# Dev & testing (install in a dev environment)
+pytest>=7.0
+black>=23.0
+flake8>=6.0
+mypy>=1.0
+
+# Notes:
+# - If you plan to run heavy training / GPU workloads, install a torch wheel that matches your CUDA version
+#   (e.g., `pip install --index-url https://download.pytorch.org/whl/cu118 torch`) for GPU support.
+# - The project contains per-subpackage `requirements.txt` files; consult subpackage READMEs for specialized deps.

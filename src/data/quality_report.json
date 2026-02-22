@@ -1,0 +1,167 @@
+{
+  "dataset_name": "Sample Clinical Data",
+  "timestamp": "2026-02-22T10:37:16.386950",
+  "n_records": 1050,
+  "n_columns": 6,
+  "issues": {
+    "missing_values": []
+  },
+  "scores": {
+    "completeness": 0.9844444444444445,
+    "outlier_rate": 0.009142857142857144,
+    "temporal_consistency": 0.95,
+    "range_compliance": 0.9836665041443199
+  },
+  "missing_values": {
+    "total_missing": "98",
+    "missing_rate_overall": 0.015555555555555555,
+    "missing_rates": {
+      "subject_id": 0.0,
+      "charttime": 0.0,
+      "heart_rate": 0.09333333333333334,
+      "sbp": 0.0,
+      "glucose": 0.0,
+      "sodium": 0.0
+    },
+    "columns_with_missing": {
+      "heart_rate": 98
+    },
+    "completely_missing_columns": []
+  },
+  "outliers": {
+    "columns_with_outliers": {
+      "heart_rate": {
+        "count": "22",
+        "rate": 0.02095238095238095,
+        "bounds": [
+          6.914417552292548,
+          144.36653322666626
+        ],
+        "outlier_values": {
+          "count": 22.0,
+          "mean": 300.0,
+          "std": 0.0,
+          "min": 300.0,
+          "25%": 300.0,
+          "50%": 300.0,
+          "75%": 300.0,
+          "max": 300.0
+        }
+      },
+      "glucose": {
+        "count": "10",
+        "rate": 0.009523809523809525,
+        "bounds": [
+          -38.17395653259648,
+          238.80787593297183
+        ],
+        "outlier_values": {
+          "count": 10.0,
+          "mean": 1000.0,
+          "std": 0.0,
+          "min": 1000.0,
+          "25%": 1000.0,
+          "50%": 1000.0,
+          "75%": 1000.0,
+          "max": 1000.0
+        }
+      },
+      "sodium": {
+        "count": "16",
+        "rate": 0.015238095238095238,
+        "bounds": [
+          125.05415646571242,
+          154.80992042761736
+        ],
+        "outlier_values": {
+          "count": 16.0,
+          "mean": 180.0,
+          "std": 0.0,
+          "min": 180.0,
+          "25%": 180.0,
+          "50%": 180.0,
+          "75%": 180.0,
+          "max": 180.0
+        }
+      }
+    },
+    "total_outliers": "48",
+    "overall_outlier_rate": 0.009142857142857144
+  },
+  "temporal_consistency": {
+    "columns": {
+      "charttime": {
+        "inconsistent_patients": 5,
+        "total_patients": 100,
+        "consistency_rate": 0.95
+      }
+    },
+    "consistency_rate": 0.95
+  },
+  "value_ranges": {
+    "columns": {
+      "heart_rate": {
+        "violations": "28",
+        "total_values": "952",
+        "violation_rate": 0.029411764705882353,
+        "expected_range": [
+          40,
+          200
+        ],
+        "actual_range": [
+          26.38098989896391,
+          300.0
+        ]
+      },
+      "sbp": {
+        "violations": "9",
+        "total_values": "1050",
+        "violation_rate": 0.008571428571428572,
+        "expected_range": [
+          70,
+          250
+        ],
+        "actual_range": [
+          61.19222730671439,
+          183.86215135689721
+        ]
+      },
+      "glucose": {
+        "violations": "14",
+        "total_values": "1050",
+        "violation_rate": 0.013333333333333334,
+        "expected_range": [
+          20,
+          800
+        ],
+        "actual_range": [
+          9.41463532537524,
+          1000.0
+        ]
+      },
+      "sodium": {
+        "violations": "16",
+        "total_values": "1050",
+        "violation_rate": 0.015238095238095238,
+        "expected_range": [
+          120,
+          160
+        ],
+        "actual_range": [
+          131.2116539299932,
+          180.0
+        ]
+      }
+    },
+    "total_violations": "67",
+    "total_values": "4102",
+    "compliance_rate": 0.9836665041443199
+  },
+  "duplicates": {
+    "exact_duplicates": "50",
+    "exact_duplicate_rate": 0.047619047619047616,
+    "unique_rows": "1000"
+  },
+  "overall_quality_score": 0.962147570290915,
+  "quality_level": "excellent"
+}
