@@ -26,6 +26,40 @@ import numpy as np
 import pandas as pd
 import torch
 
+from rewards.health_reward import HealthOutcomeReward
+from rewards.composite_reward import CompositeRewardFunction
+from rewards.safety_reward import SafetyPenalty
+from rewards.reward_config import RewardConfig
+
+from environments import DiabetesEnv, AdherenceEnv
+from rewards import (
+    CompositeRewardFunction, RewardConfig,
+    AdherenceReward, HealthOutcomeReward, SafetyPenalty, CostEffectivenessReward
+)
+
+from evaluation import (
+    OffPolicyEvaluator
+)
+
+from data import SyntheticDataGenerator
+
+from models.rl import CQLConfig
+
+from models.baselines import (
+            create_diabetes_rule_policy,
+            create_random_policy,
+            create_safe_random_policy,
+            create_mean_action_policy,
+            create_regression_policy,
+            create_knn_policy,
+            create_behavior_cloning_policy,
+            compare_all_baselines
+        )
+
+from environments.diabetes_env import DiabetesEnvConfig
+from environments.adherence_env import AdherenceEnvConfig
+
+
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -129,26 +163,29 @@ class IntegratedSolutionRunner:
         """Generate synthetic patient data."""
         logger.info("Generating synthetic diabetes patient data...")
         
-        from src.data import SyntheticDataGenerator
         
-        generator = SyntheticDataGenerator(seed=42)
         
-        # Generate patient cohort
-        patients = generator.generate_diabetes_cohort(
-            n_patients=self.config.n_synthetic_patients,
-            time_horizon=365
+        generator = SyntheticDataGenerator(
+            random_seed=42
         )
         
-        logger.info(f"✓ Generated {len(patients)} synthetic patients")
-        
-        # Create trajectories
+        # Generate patient cohort and trajectories
+        patients = generator.generate_diabetes_population(
+            n_patients=self.config.n_synthetic_patients
+        )
+
         trajectories = []
         for patient in patients:
-            trajectory = generator.simulate_trajectory(
+            patient_trajectories = generator.simulate_patient_trajectory(
                 patient=patient,
-                n_steps=self.config.trajectory_length
+                time_horizon_days=self.config.trajectory_length,
+                treatment_policy=None  # Use default conservative policy
             )
-            trajectories.extend(trajectory)
+            trajectories.extend(patient_trajectories)
+        
+       
+        
+        logger.info(f"✓ Generated {len(patients)} synthetic patients")
         
         logger.info(f"✓ Generated {len(trajectories)} transitions")
         
@@ -182,7 +219,7 @@ class IntegratedSolutionRunner:
         """Prepare data from MIMIC-III."""
         logger.info("Loading MIMIC-III data...")
         
-        from src.data import (
+        from data import (
             MIMICLoader, CohortBuilder, FeatureEngineer,
             DataPreprocessor, split_train_val_test
         )
@@ -277,38 +314,44 @@ class IntegratedSolutionRunner:
         logger.info("\n" + "=" * 80)
         logger.info("STAGE 2: ENVIRONMENT SETUP")
         logger.info("=" * 80)
-        
-        from src.environments import DiabetesEnv, AdherenceEnv
-        from src.rewards import create_composite_reward
+    
         
         # Create diabetes environment
         logger.info("Creating diabetes management environment...")
-        diabetes_env = DiabetesEnv(
-            patient_params={
-                'insulin_sensitivity': 1.0,
-                'baseline_glucose': 120.0
-            }
+        # If you want custom settings, set them here; otherwise you can just do DiabetesEnv()
+        diabetes_cfg = DiabetesEnvConfig(
+            # safe defaults; tweak later if you want
+            max_steps=288,                 # e.g., 24h with dt=0.0833 (5 min) -> ~288 steps
+            dt=1/12,                       # 5 minutes in hours
+            patient_variability=0.1,       # modest heterogeneity
+            initial_glucose_range=(120.0, 220.0),
+            target_glucose_range=(80.0, 140.0),
+            max_insulin_dose=10.0
         )
+
+        diabetes_env = DiabetesEnv(config=diabetes_cfg)
         
         # Create adherence environment
         logger.info("Creating medication adherence environment...")
-        adherence_env = AdherenceEnv(
-            adherence_params={
-                'alpha': 0.7,
-                'beta': 0.3
-            }
-        )
+        adherence_cfg = AdherenceEnvConfig()   # uses defaults, including max_steps
+        adherence_env = AdherenceEnv(config=adherence_cfg)
         
         # Configure rewards
         logger.info("Configuring composite reward function...")
-        reward_config = {
-            'w_adherence': 0.3,
-            'w_health': 0.4,
-            'w_adverse': 0.2,
-            'w_cost': 0.1
-        }
-        
-        composite_reward = create_composite_reward(reward_config)
+
+        # Map runner's "w_adverse" to RewardConfig's "w_safety"
+        reward_config = RewardConfig(
+          w_adherence=0.3,
+          w_health=0.4,
+          w_safety=0.2,
+          w_cost=0.1
+        )
+
+        composite_reward = CompositeRewardFunction(reward_config)
+        composite_reward.add_component("adherence", AdherenceReward(reward_config), reward_config.w_adherence)
+        composite_reward.add_component("health", HealthOutcomeReward(reward_config), reward_config.w_health)
+        composite_reward.add_component("safety", SafetyPenalty(reward_config), reward_config.w_safety)
+        composite_reward.add_component("cost", CostEffectivenessReward(reward_config), reward_config.w_cost)
         
         self.results['environments'] = {
             'diabetes_env': diabetes_env,
@@ -324,16 +367,6 @@ class IntegratedSolutionRunner:
         logger.info("STAGE 3: BASELINE TRAINING")
         logger.info("=" * 80)
         
-        from src.models.baselines import (
-            create_diabetes_rule_policy,
-            create_random_policy,
-            create_safe_random_policy,
-            create_mean_action_policy,
-            create_regression_policy,
-            create_knn_policy,
-            create_behavior_cloning_policy,
-            compare_all_baselines
-        )
         
         # Get data
         if 'data' in self.results:
@@ -450,7 +483,7 @@ class IntegratedSolutionRunner:
             logger.info("⚠ CQL training skipped (use --train-cql to enable)")
             return
         
-        from src.models.rl import ConservativeQLearning, CQLConfig
+        
         
         # Get data
         if 'data' not in self.results:
@@ -487,7 +520,7 @@ class IntegratedSolutionRunner:
         
         # Training loop (simplified - full implementation in src/models/rl)
         logger.info(f"Training dataset size: {len(train_data)} transitions")
-        logger.info("Note: Full CQL training requires src.models.rl module")
+        logger.info("Note: Full CQL training requires src/models/rl module")
         logger.info("This is a placeholder - implement full training in next iteration")
         
         # Save placeholder results
@@ -506,11 +539,6 @@ class IntegratedSolutionRunner:
         logger.info("STAGE 5: EVALUATION")
         logger.info("=" * 80)
         
-        from src.evaluation import (
-            OffPolicyEvaluator,
-            SafetyMetrics,
-            ClinicalMetrics
-        )
         
         # Get test data
         if 'baselines' not in self.results:

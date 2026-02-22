@@ -34,7 +34,7 @@ python_version=$(python3 --version 2>&1 | awk '{print $2}')
 print_status "Python version: $python_version"
 
 # Check if we're in the correct directory
-if [ ! -f "run_integrated_solution.py" ]; then
+if [ ! -f "src/run_integrated_solution.py" ]; then
     print_error "Please run this script from the project root directory"
     exit 1
 fi
@@ -74,7 +74,7 @@ case $choice in
     1)
         echo ""
         print_status "Running Quick Demo..."
-        python3 run_integrated_solution.py \
+        python3 src/run_integrated_solution.py \
             --mode synthetic \
             --n-synthetic-patients 100 \
             --trajectory-length 20 \
@@ -83,7 +83,7 @@ case $choice in
     2)
         echo ""
         print_status "Running Full Synthetic Pipeline..."
-        python3 run_integrated_solution.py \
+        python3 src/run_integrated_solution.py \
             --mode synthetic \
             --n-synthetic-patients 1000 \
             --trajectory-length 30 \
@@ -100,7 +100,7 @@ case $choice in
         fi
         
         print_status "Running MIMIC-III Sample Pipeline..."
-        python3 run_integrated_solution.py \
+        python3 src/run_integrated_solution.py \
             --mode full \
             --mimic-dir "$mimic_dir" \
             --use-sample \
@@ -125,7 +125,7 @@ case $choice in
         fi
         
         print_status "Running Full MIMIC-III Pipeline..."
-        python3 run_integrated_solution.py \
+        python3 src/run_integrated_solution.py \
             --mode full \
             --mimic-dir "$mimic_dir" \
             $cql_flag \

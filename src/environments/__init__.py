@@ -13,8 +13,8 @@ This package provides:
 """
 
 from .base_env import BaseHealthcareEnv
-from .diabetes_env import DiabetesManagementEnv, DiabetesEnvConfig
-from .adherence_env import MedicationAdherenceEnv, AdherenceEnvConfig
+from .diabetes_env import DiabetesManagementEnv as DiabetesEnv, DiabetesEnvConfig
+from .adherence_env import MedicationAdherenceEnv as AdherenceEnv, AdherenceEnvConfig
 from .disease_models import (
     BergmanMinimalModel,
     BergmanModelParams,
@@ -47,9 +47,9 @@ __all__ = [
     'BaseHealthcareEnv',
     
     # Specific environments
-    'DiabetesManagementEnv',
+    'DiabetesEnv',
     'DiabetesEnvConfig',
-    'MedicationAdherenceEnv',
+    'AdherenceEnv',
     'AdherenceEnvConfig',
     
     # Disease models

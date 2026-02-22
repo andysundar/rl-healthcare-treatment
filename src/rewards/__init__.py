@@ -100,4 +100,4 @@ __all__ = [
 ]
 
 __version__ = '1.0.0'
-__author__ = 'Andy Bandopadhyay'
+__author__ = 'Anindya Bandopadhyay'

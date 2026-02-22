@@ -6,7 +6,7 @@ using supervised learning. It represents what happens when we simply try to
 replicate past clinical decisions.
 """
 
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,6 +14,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import logging
 from pathlib import Path
+import pandas as pd 
 
 from .base_baseline import BaselinePolicy, BaselineMetrics
 
@@ -22,6 +23,115 @@ logger = logging.getLogger(__name__)
 
 class BehaviorCloningDataset(Dataset):
     """Dataset for behavior cloning."""
+
+    @staticmethod
+    def _to_numeric_array(
+        x: Union[np.ndarray, "pd.DataFrame", "pd.Series", List[Any]],
+        name: str,
+        dtype: type = np.float32,
+    ) -> np.ndarray:
+        """Convert input to a numeric numpy array suitable for Torch tensors.
+
+        This prevents crashes when upstream accidentally passes string/object
+        dtypes (e.g., gender/ethnicity, ICD codes, medication names, timestamps)
+        into the BC baseline.
+        """
+
+        # pandas path (best for mixed dtypes)
+        if pd is not None and isinstance(x, (pd.DataFrame, pd.Series)):
+            if isinstance(x, pd.Series):
+                x = x.to_frame()
+
+            non_numeric_cols = list(x.select_dtypes(exclude=["number"]).columns)
+            if non_numeric_cols:
+                logger.warning(
+                    "[BC] %s contains non-numeric columns (%d). Applying one-hot encoding: %s",
+                    name,
+                    len(non_numeric_cols),
+                    non_numeric_cols[:25],
+                )
+                x = pd.get_dummies(x, dummy_na=True)
+
+            # Coerce any remaining non-numeric values
+            x = x.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            arr = x.to_numpy(dtype=dtype, copy=False)
+            logger.info(
+                "[BC] %s converted via pandas -> shape=%s dtype=%s",
+                name,
+                arr.shape,
+                arr.dtype,
+            )
+            return arr
+
+        # numpy path
+        arr = np.asarray(x)
+        original_dtype = getattr(arr, "dtype", None)
+
+        # If we received a 1D object array where each element is itself a vector/list,
+        # stack it into a proper 2D matrix. This happens in some pipelines where
+        # states are stored as a column of arrays.
+        try:
+            if hasattr(arr, 'dtype') and arr.dtype.kind == 'O' and arr.ndim == 1 and len(arr) > 0:
+                first = arr[0]
+                # 1) element is vector-like (list/tuple/ndarray)
+                if isinstance(first, (list, tuple)) or (hasattr(first, 'shape') and hasattr(first, '__array__')):
+                    import numpy as _np
+                    arr = _np.stack([_np.asarray(v) for v in arr], axis=0)
+                    logger.info('[BC] %s detected as sequence-of-vectors -> stacked shape=%s dtype=%s', name, arr.shape, getattr(arr,'dtype',None))
+                # 2) element is dict-like (list of feature dicts) -> expand to DataFrame columns
+                elif isinstance(first, dict) and pd is not None:
+                    df = pd.DataFrame(list(arr))
+                    df = df.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+                    arr = df.to_numpy(copy=False)
+                    logger.info('[BC] %s detected as sequence-of-dicts -> expanded shape=%s dtype=%s', name, arr.shape, getattr(arr,'dtype',None))
+        except Exception:
+            pass
+
+        # Ensure 2D for states/actions if a single feature is provided as 1D
+        if hasattr(arr, 'ndim') and arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+            
+        if hasattr(arr, "dtype") and arr.dtype.kind in ("U", "S", "O"):
+            logger.warning(
+                "[BC] %s has non-numeric dtype=%s. Attempting numeric coercion.",
+                name,
+                original_dtype,
+            )
+            if pd is not None:
+                # Use pandas coercion as a robust fallback
+                df = pd.DataFrame(arr)
+                df = df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+                arr = df.to_numpy(copy=False)
+            else:
+                # Best-effort conversion without pandas
+                try:
+                    arr = arr.astype(np.float64)
+                except Exception:
+                    sample = arr.ravel()[:10].tolist()
+                    raise TypeError(
+                        f"{name} contains non-numeric values and pandas is unavailable. "
+                        f"Sample values: {sample}"
+                    )
+
+        arr = arr.astype(dtype, copy=False)
+
+        if original_dtype is not None and original_dtype != arr.dtype:
+            logger.info(
+                "[BC] %s cast: %s -> %s (shape=%s)",
+                name,
+                original_dtype,
+                arr.dtype,
+                arr.shape,
+            )
+        else:
+            logger.info(
+                "[BC] %s shape=%s dtype=%s",
+                name,
+                getattr(arr, "shape", None),
+                getattr(arr, "dtype", None),
+            )
+
+        return arr
     
     def __init__(self, states: np.ndarray, actions: np.ndarray):
         """
@@ -31,8 +141,13 @@ class BehaviorCloningDataset(Dataset):
             states: State observations
             actions: Expert actions
         """
-        self.states = torch.FloatTensor(states)
-        self.actions = torch.FloatTensor(actions)
+        # Defensive conversion: prevents crashes when upstream accidentally passes
+        # string/object dtypes (common with EHR categorical features).
+        states_np = self._to_numeric_array(states, name="states", dtype=np.float32)
+        actions_np = self._to_numeric_array(actions, name="actions", dtype=np.float32)
+
+        self.states = torch.from_numpy(states_np)
+        self.actions = torch.from_numpy(actions_np)
         
         assert len(self.states) == len(self.actions), \
             "States and actions must have same length"
@@ -120,6 +235,12 @@ class BehaviorCloningNetwork(nn.Module):
         Returns:
             Predicted action
         """
+         # Normalize input shape to (batch, features)
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        elif state.dim() > 2:
+            state = state.view(state.size(0), -1)
+
         return self.network(state)
 
 
@@ -140,8 +261,8 @@ class BehaviorCloningPolicy(BaselinePolicy):
     
     def __init__(self,
                  name: str = "Behavior-Cloning",
-                 action_space: Dict[str, Any] = None,
-                 state_dim: int = None,
+                 action_space: Optional[Dict[str, Any]] = None,
+                 state_dim: Optional[int] = None,
                  hidden_dims: List[int] = [256, 256],
                  learning_rate: float = 1e-3,
                  device: str = 'cpu'):
@@ -156,6 +277,13 @@ class BehaviorCloningPolicy(BaselinePolicy):
             learning_rate: Learning rate for training
             device: Computation device
         """
+        if action_space is None:
+            logger.warning("action_space not provided; using default continuous space with dim=1")
+            raise ValueError("action_space must be provided")
+        if state_dim is None:
+            logger.warning("state_dim not provided; cannot initialize network without state dimension")
+            raise ValueError("state_dim must be provided")
+        
         super().__init__(name, action_space, state_dim, device)
         
         # Get action dimension
@@ -208,6 +336,21 @@ class BehaviorCloningPolicy(BaselinePolicy):
         """
         # Create dataset and dataloader
         train_dataset = BehaviorCloningDataset(states, actions)
+
+        # If upstream feature processing changed the effective state dimension (e.g.,
+        # categorical one-hot expansion or accidental collapse to a single column),
+        # rebuild the network to match the data.
+        inferred_state_dim = int(train_dataset.states.shape[1]) if train_dataset.states.ndim >= 2 else 1
+        if hasattr(self.network, 'state_dim') and self.network.state_dim != inferred_state_dim:
+            logger.warning('[BC] Network state_dim=%s does not match training data dim=%s. Rebuilding network.', self.network.state_dim, inferred_state_dim)
+            action_dim = getattr(self.network, 'action_dim', None)
+            if action_dim is None:
+                action_dim = self.action_space.get('dim', 1)
+            hidden_dims = [m.out_features for m in self.network.network if isinstance(m, nn.Linear)][:-1] or [256, 256]
+            self.network = BehaviorCloningNetwork(state_dim=inferred_state_dim, action_dim=action_dim, hidden_dims=hidden_dims).to(self.device)
+            self.optimizer = optim.Adam(self.network.parameters(), lr=self.optimizer.param_groups[0]['lr'])
+            logger.info('[BC] Rebuilt network: state_dim=%d action_dim=%d', inferred_state_dim, action_dim)
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -215,9 +358,40 @@ class BehaviorCloningPolicy(BaselinePolicy):
             num_workers=0
         )
         
+
+        # Extra safety: infer the *actual* feature dimension from a real batch.
+        # This catches edge-cases where dataset-level shape looks OK but individual
+        # samples collapse to a scalar/column during collation.
+        try:
+            sample_states, _ = next(iter(train_loader))
+            if sample_states.ndim == 1:
+                sample_states = sample_states.unsqueeze(1)
+            actual_state_dim = int(sample_states.shape[-1])
+            if hasattr(self.network, 'state_dim') and self.network.state_dim != actual_state_dim:
+                logger.warning(
+                    '[BC] Batch state_dim=%s differs from network state_dim=%s (sample batch shape=%s). Rebuilding network.',
+                    actual_state_dim,
+                    self.network.state_dim,
+                    tuple(sample_states.shape),
+                )
+                action_dim = getattr(self.network, 'action_dim', None) or self.action_space.get('dim', 1)
+                hidden_dims = [m.out_features for m in self.network.network if isinstance(m, nn.Linear)][:-1] or [256, 256]
+                self.network = BehaviorCloningNetwork(
+                    state_dim=actual_state_dim,
+                    action_dim=action_dim,
+                    hidden_dims=hidden_dims
+                ).to(self.device)
+                self.optimizer = optim.Adam(self.network.parameters(), lr=self.optimizer.param_groups[0]['lr'])
+                logger.info('[BC] Rebuilt network from batch: state_dim=%d action_dim=%d', actual_state_dim, action_dim)
+        except StopIteration:
+            pass
+        except Exception as e:
+            logger.warning('[BC] Unable to infer batch state_dim (%s). Continuing with configured network.', e)
+        
         # Validation set
         has_val = val_states is not None and val_actions is not None
         if has_val:
+            assert val_states is not None and val_actions is not None
             val_dataset = BehaviorCloningDataset(val_states, val_actions)
             val_loader = DataLoader(
                 val_dataset,
@@ -364,7 +538,7 @@ class BehaviorCloningPolicy(BaselinePolicy):
             return glucose < 50 or glucose > 300
         return False
     
-    def save(self, path: str):
+    def save(self, path: Union[str, Path]):
         """
         Save policy to disk.
         
@@ -384,7 +558,7 @@ class BehaviorCloningPolicy(BaselinePolicy):
         
         logger.info(f"Saved policy to {path}")
     
-    def load(self, path: str):
+    def load(self, path: Union[str, Path]):
         """
         Load policy from disk.
         

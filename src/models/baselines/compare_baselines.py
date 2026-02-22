@@ -156,6 +156,10 @@ class BaselineComparator:
                 best_score = score
                 best_name = name
         
+        if best_name is None:
+            logger.warning(f"No valid results found for metric '{metric}'.")
+            raise ValueError(f"No valid results found for metric '{metric}'.")
+        
         return best_name, self.baselines[best_name], best_score
     
     def compare_against_rl(self, 
@@ -200,6 +204,7 @@ class BaselineComparator:
             Report as markdown string
         """
         if not self.results:
+            logger.warning("No evaluation results to report.")
             raise ValueError("No evaluation results. Call evaluate_all() first.")
         
         report_lines = []
@@ -247,16 +252,16 @@ class BaselineComparator:
         
         # Save if path provided
         if output_path:
-            output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_file = Path(output_path)
+            output_file.parent.mkdir(parents=True, exist_ok=True)
             
-            with open(output_path, 'w') as f:
+            with open(output_file, 'w') as f:
                 f.write(report)
             
-            logger.info(f"Saved report to {output_path}")
+            logger.info(f"Saved report to {output_file}")
             
             # Save raw results as JSON
-            json_path = output_path.with_suffix('.json')
+            json_path = output_file.with_suffix('.json')
             with open(json_path, 'w') as f:
                 json.dump(
                     {name: asdict(metrics) for name, metrics in self.results.items()},
@@ -276,11 +281,11 @@ class BaselineComparator:
         """
         df = self.evaluate_all(verbose=False)
         
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
         
-        df.to_csv(output_path)
-        logger.info(f"Exported results to {output_path}")
+        df.to_csv(output_file)
+        logger.info(f"Exported results to {output_file}")
 
 
 def compare_all_baselines(test_data: List,

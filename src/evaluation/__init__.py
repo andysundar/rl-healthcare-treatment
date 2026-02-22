@@ -4,7 +4,7 @@ Healthcare RL Evaluation Framework
 Comprehensive evaluation tools for offline RL in healthcare settings.
 """
 
-from .config import EvaluationConfig
+from ..configs.config import EvaluationConfig
 from .off_policy_eval import OffPolicyEvaluator, Trajectory, OPEResult
 from .safety_metrics import SafetyEvaluator, SafetyResult
 from .clinical_metrics import ClinicalEvaluator, ClinicalResult
