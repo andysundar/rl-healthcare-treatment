@@ -57,17 +57,17 @@ python src/run_integrated_solution.py \
 
 ```bash
 # Data pipeline only
-python examples/example_pipeline.py --sample --sample-size 100
+python src/examples/example_pipeline.py --sample --sample-size 100
 
 # Baseline comparison
-python examples/example_usage.py
+python src/examples/example_usage.py
 
 # Environment demos
-python examples/diabetes_env_example.py
-python examples/adherence_env_example.py
+python src/examples/diabetes_env_example.py
+python src/examples/adherence_env_example.py
 
 # Evaluation
-python examples/run_evaluation.py
+python src/examples/run_evaluation.py
 ```
 
 ---
@@ -82,7 +82,9 @@ rl-healthcare-treatment/
 │   ├── models/            # RL algorithms (CQL, baselines, encoders, safety)
 │   ├── rewards/           # Reward function implementations
 │   ├── evaluation/        # Evaluation framework (OPE, safety, clinical metrics)
-│   └── configs/           # Configuration files
+│   ├── configs/           # Configuration files
+|   ├── run_integrated_solution.py    # Main integrated runner
+|   └── quick_start.sh                # Interactive setup script
 │
 ├── examples/              # Runnable examples
 │   ├── example_pipeline.py       # Complete data pipeline
@@ -91,8 +93,6 @@ rl-healthcare-treatment/
 │
 ├── tests/                 # Unit tests
 │
-├── run_integrated_solution.py    # Main integrated runner
-├── quick_start.sh                # Interactive setup script
 ├── INTEGRATION_GUIDE.md          # Detailed integration guide
 └── README.md                     # This file
 ```
