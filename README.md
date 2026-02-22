@@ -8,27 +8,27 @@
 
 ---
 
-## 🎯 Project Overview
+## Project Overview
 
 This project develops a **safety-constrained offline reinforcement learning framework** for personalized healthcare treatment recommendations. The system uses Conservative Q-Learning (CQL) on MIMIC-III clinical data to optimize medication dosing, appointment scheduling, and adherence interventions while maintaining strict safety guarantees.
 
 ### Key Features
 
-- ✅ **Offline RL Algorithms:** Conservative Q-Learning (CQL), Batch Constrained Q-Learning (BCQ)
-- ✅ **Safety-First Design:** Multi-layered safety validation, hard constraints, clinical guideline compliance
-- ✅ **Comprehensive Baselines:** Rule-based, statistical, behavior cloning policies for comparison
-- ✅ **Off-Policy Evaluation:** Weighted Importance Sampling (WIS), Doubly Robust (DR), Direct Method
-- ✅ **Clinical Validation:** Safety metrics, guideline compliance, interpretability tools
-- ✅ **Production-Ready Code:** Modular architecture, extensive testing, documentation
+- **Offline RL Algorithms:** Conservative Q-Learning (CQL), Batch Constrained Q-Learning (BCQ)
+- **Safety-First Design:** Multi-layered safety validation, hard constraints, clinical guideline compliance
+- **Comprehensive Baselines:** Rule-based, statistical, behavior cloning policies for comparison
+- **Off-Policy Evaluation:** Weighted Importance Sampling (WIS), Doubly Robust (DR), Direct Method
+- **Clinical Validation:** Safety metrics, guideline compliance, interpretability tools
+- **Production-Ready Code:** Modular architecture, extensive testing, documentation
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Option 1: Interactive Quick Start (Recommended)
 
 ```bash
-./quick_start.sh
+./src/quick_start.sh
 ```
 
 This script guides you through:
@@ -44,10 +44,10 @@ This script guides you through:
 pip install -r requirements.txt --break-system-packages
 
 # Run with synthetic data (no prerequisites)
-python run_integrated_solution.py --mode synthetic
+python src/run_integrated_solution.py --mode synthetic
 
 # Run with MIMIC-III data
-python run_integrated_solution.py \
+python src/run_integrated_solution.py \
     --mode full \
     --mimic-dir data/raw/mimic-iii \
     --train-cql
@@ -72,7 +72,7 @@ python examples/run_evaluation.py
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 rl-healthcare-treatment/
@@ -99,7 +99,7 @@ rl-healthcare-treatment/
 
 ---
 
-## 📊 System Architecture
+## System Architecture
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
@@ -121,7 +121,7 @@ rl-healthcare-treatment/
 
 ---
 
-## 🔬 Methodology
+## Methodology
 
 ### 1. Patient Representation
 
@@ -180,7 +180,7 @@ where Conservative_Penalty penalizes Q-values on out-of-distribution actions
 
 ---
 
-## 📈 Evaluation Framework
+## Evaluation Framework
 
 ### Off-Policy Evaluation (OPE)
 
@@ -219,7 +219,7 @@ where violations = steps with state outside safe physiological ranges
 
 ---
 
-## 🧪 Experiments
+## Experiments
 
 ### Baseline Comparisons
 
@@ -249,7 +249,7 @@ From preliminary experiments:
 
 ---
 
-## 🛠️ Development Setup
+## Development Setup
 
 ### System Requirements
 
@@ -287,7 +287,7 @@ Expected files:
 
 ---
 
-## 📝 Usage Examples
+## Usage Examples
 
 ### Example 1: Quick Baseline Comparison
 
@@ -355,7 +355,7 @@ print(f"HbA1c improvement: {trajectory[-1]['hba1c_change']:.2f}%")
 
 ---
 
-## 🧪 Testing
+## Testing
 
 ```bash
 # Run all tests
@@ -372,7 +372,7 @@ pytest --cov=src tests/
 
 ---
 
-## 📚 Documentation
+## Documentation
 
 - **Integration Guide:** `INTEGRATION_GUIDE.md` - Detailed setup and usage
 - **Data Module:** `src/data/README.md` - Data processing documentation
@@ -382,7 +382,7 @@ pytest --cov=src tests/
 
 ---
 
-## 📊 Results & Outputs
+## Results & Outputs
 
 Running the integrated solution generates:
 
@@ -399,7 +399,7 @@ outputs/
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 This is a thesis project, but feedback is welcome:
 
@@ -409,7 +409,7 @@ This is a thesis project, but feedback is welcome:
 
 ---
 
-## 📄 Citation
+## Citation
 
 If you use this code in your research, please cite:
 
@@ -426,13 +426,13 @@ If you use this code in your research, please cite:
 
 ---
 
-## 📜 License
+## License
 
-This project is licensed under the MIT License - see the `LICENSE` file for details.
+This project is licensed under the Apache 2.0 License - see the `LICENSE` file for details.
 
 ---
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - **Supervisor:** Dr. Pradip Sasmal, IIT Jodhpur
 - **Datasets:** MIMIC-III Critical Care Database (MIT-LCP)
@@ -443,11 +443,11 @@ This project is licensed under the MIT License - see the `LICENSE` file for deta
 
 ---
 
-## 📞 Contact
+## Contact
 
 **Anindya Bandopadhyay**  
 M.Tech CSE, IIT Jodhpur  
-Email: m23csa508@iitj.ac.in  
+Email: m23csa508@iitj.ac.in / anindyabandopadhyay@gmail.com
 GitHub: [@andysundar](https://github.com/andysundar)
 
 **Project Supervisor**  
@@ -456,7 +456,7 @@ Department of Mathematics, IIT Jodhpur
 
 ---
 
-## 🗓️ Project Timeline
+## Project Timeline
 
 - **Start:** August 2024
 - **Proposal Defense:** September 2024
@@ -465,10 +465,5 @@ Department of Mathematics, IIT Jodhpur
 - **Experiments:** February 2026
 - **Thesis Writing:** January-March 2026
 - **Defense:** March 2026
-- **Deadline:** **March 25, 2026** ⏰
+- **Deadline:** **March 25, 2026** 
 
----
-
-**Current Status:** ~70% Complete | **Remaining:** 2 months to deadline
-
-Last Updated: February 22, 2026
