@@ -382,7 +382,7 @@ def example_6_production_workflow():
         print(f"\nAvailable checkpoints ({len(checkpoints)}):")
         
         for cp in checkpoints:
-            checkpoint = torch.load(cp, map_location='cpu')
+            checkpoint = torch.load(cp, map_location='cpu', weights_only=False)
             epoch = checkpoint.get('epoch', -1)
             val_loss = checkpoint.get('val_loss', None)
             is_best = checkpoint.get('is_best', False)

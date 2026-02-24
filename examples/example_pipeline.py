@@ -17,11 +17,17 @@ Date: January 2026
 """
 
 import logging
+import sys
 from pathlib import Path
 
 import pandas as pd
 
-from src.data import (
+# Ensure src/ is on sys.path when run directly
+_src = str(Path(__file__).parent.parent / "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+
+from data import (
     MIMICLoader,
     DataPreprocessor,
     FeatureEngineer,

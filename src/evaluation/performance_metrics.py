@@ -9,8 +9,8 @@ Standard RL performance metrics including:
 """
 
 import numpy as np
-from typing import List, Dict, Tuple
-from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, field
 import logging
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ class PerformanceResult:
     min_return: float
     max_return: float
     metadata: Dict = None
+    personalization_score: Optional[float] = None  # PDF §7.2
 
 
 class PerformanceEvaluator:
@@ -184,6 +185,36 @@ class PerformanceEvaluator:
         self._print_summary(result)
         return result
     
+    def compute_personalization_score(
+        self,
+        source_trajs: List[List[np.ndarray]],
+        target_trajs: List[List[np.ndarray]],
+        source_encoder,
+        target_encoder,
+    ) -> float:
+        """
+        Compute the personalization score from PDF §7.2:
+
+            score = (1/T) * Σ_t  cosine_similarity( fθ(s_t),  fϕ(x_t) )
+
+        Parameters
+        ----------
+        source_trajs  : list of trajectories; each is a list of raw state np.ndarray
+        target_trajs  : list of trajectories (same length); each is a list of raw states
+        source_encoder: StateEncoderWrapper for the source domain
+        target_encoder: StateEncoderWrapper for the target domain
+
+        Returns
+        -------
+        float : mean personalization score across all trajectory pairs
+        """
+        from .interpretability import PersonalizationScorer
+        scorer = PersonalizationScorer(source_encoder, target_encoder)
+        result = scorer.compute_batch(source_trajs, target_trajs)
+        score = result['mean']
+        logger.info(f"Personalization score: {score:.4f} +/- {result['std']:.4f}")
+        return score
+
     def _print_summary(self, result: PerformanceResult) -> None:
         """Print performance evaluation summary."""
         print("\n" + "="*70)
@@ -194,4 +225,6 @@ class PerformanceEvaluator:
         print(f"Return Range:    [{result.min_return:.3f}, {result.max_return:.3f}]")
         print(f"Success Rate:    {result.success_rate:.3f}")
         print(f"Avg Episode Len: {result.average_episode_length:.1f}")
+        if result.personalization_score is not None:
+            print(f"Personalization: {result.personalization_score:.4f}")
         print("="*70 + "\n")

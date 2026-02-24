@@ -55,7 +55,12 @@ class BaseRLAgent(ABC):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.gamma = gamma
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        _req = torch.device(device)
+        if _req.type == "cuda" and not torch.cuda.is_available():
+            _req = torch.device("cpu")
+        elif _req.type == "mps" and not torch.backends.mps.is_available():
+            _req = torch.device("cpu")
+        self.device = _req
         
         logger.info(f"Initialized {self.__class__.__name__} on {self.device}")
         logger.info(f"State dim: {state_dim}, Action dim: {action_dim}, Gamma: {gamma}")
@@ -158,7 +163,7 @@ class BaseRLAgent(ABC):
         Args:
             path: Path to checkpoint file
         """
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         # Verify dimensions match
         assert checkpoint['state_dim'] == self.state_dim, "State dimension mismatch"
@@ -191,7 +196,12 @@ class BaseRLAgent(ABC):
         Returns:
             self for method chaining
         """
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        _req = torch.device(device)
+        if _req.type == 'cuda' and not torch.cuda.is_available():
+            _req = torch.device('cpu')
+        elif _req.type == 'mps' and not torch.backends.mps.is_available():
+            _req = torch.device('cpu')
+        self.device = _req
         return self
     
     def train_mode(self) -> None:

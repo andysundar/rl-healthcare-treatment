@@ -24,6 +24,20 @@ class MeanActionPolicy(BaselinePolicy):
     """
     Policy that always selects the mean (or mode) action from the training data.
     """
+
+    def __init__(self,
+                 name: str = 'Mean-Action',
+                 action_space: Optional[Dict[str, Any]] = None,
+                 state_dim: Optional[int] = None,
+                 device: str = 'cpu'):
+        action_space = action_space or {'type': 'continuous', 'dim': 1,
+                                        'low': np.array([0.0]), 'high': np.array([1.0])}
+        state_dim = state_dim or 10
+        super().__init__(name=name, action_space=action_space,
+                         state_dim=state_dim, device=device)
+        self.is_fitted = False
+        self.mean_action = None
+
     def select_action(self, state: np.ndarray, deterministic: bool = True):
         """
         Select the mean (or mode) action, independent of state.

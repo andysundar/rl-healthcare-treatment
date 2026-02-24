@@ -565,7 +565,7 @@ class BehaviorCloningPolicy(BaselinePolicy):
         Args:
             path: Path to load policy from
         """
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         self.network.load_state_dict(checkpoint['network_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])

@@ -11,6 +11,12 @@ from .clinical_metrics import ClinicalEvaluator, ClinicalResult
 from .performance_metrics import PerformanceEvaluator, PerformanceResult
 from .comparison import PolicyComparator
 from .visualizations import EvaluationVisualizer
+from .interpretability import (
+    InterpretabilityConfig,
+    CounterfactualExplainer,
+    DecisionRuleExtractor,
+    PersonalizationScorer,
+)
 
 __version__ = "1.0.0"
 
@@ -27,4 +33,9 @@ __all__ = [
     'SafetyResult',
     'ClinicalResult',
     'PerformanceResult',
+    # Interpretability
+    'InterpretabilityConfig',
+    'CounterfactualExplainer',
+    'DecisionRuleExtractor',
+    'PersonalizationScorer',
 ]

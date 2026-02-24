@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 import logging
 
-from encoder_config import EncoderConfig
+from .encoder_config import EncoderConfig
 
 
 logger = logging.getLogger(__name__)
@@ -147,7 +147,7 @@ class BasePatientEncoder(nn.Module, ABC):
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
         
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         # Load model state
         self.load_state_dict(checkpoint['model_state_dict'], strict=strict)

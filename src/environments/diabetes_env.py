@@ -133,7 +133,7 @@ class DiabetesManagementEnv(BaseHealthcareEnv):
         self.meal_carbs_today = []
         
         # Initialize base environment
-        super().__init__(config, render_mode)
+        super().__init__(self.config, render_mode)
     
     def _get_observation_space(self) -> spaces.Space:
         """Define observation space."""

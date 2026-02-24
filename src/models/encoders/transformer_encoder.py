@@ -11,9 +11,9 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 import logging
 
-from base_encoder import BasePatientEncoder
-from encoder_config import EncoderConfig
-from encoder_utils import (
+from .base_encoder import BasePatientEncoder
+from .encoder_config import EncoderConfig
+from .encoder_utils import (
     create_padding_mask,
     PositionalEncoding,
     initialize_weights,

@@ -15,6 +15,10 @@ This package provides:
 from .base_env import BaseHealthcareEnv
 from .diabetes_env import DiabetesManagementEnv as DiabetesEnv, DiabetesEnvConfig
 from .adherence_env import MedicationAdherenceEnv as AdherenceEnv, AdherenceEnvConfig
+
+# Legacy aliases used by example scripts
+DiabetesManagementEnv  = DiabetesEnv
+MedicationAdherenceEnv = AdherenceEnv
 from .disease_models import (
     BergmanMinimalModel,
     BergmanModelParams,

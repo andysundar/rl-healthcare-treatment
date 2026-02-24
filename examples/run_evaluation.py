@@ -15,22 +15,22 @@ Date: January 2026
 import sys
 from pathlib import Path
 
-# Add your project root to path
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
+# Ensure src/ is on sys.path when run directly
+_src = str(Path(__file__).parent.parent / "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 
 import numpy as np
 import torch
 from typing import List, Tuple
 
-# Import evaluation framework
-from src.evaluation import (
-    ComprehensiveEvaluator,
-    EvaluationFrameworkConfig,
-    OPEConfig,
-    SafetyConfig,
-    ClinicalConfig
-)
+# Import evaluation framework (actual API)
+from evaluation.safety_metrics import SafetyEvaluator
+from evaluation.clinical_metrics import ClinicalEvaluator
+from evaluation.performance_metrics import PerformanceEvaluator
+from evaluation.off_policy_eval import OffPolicyEvaluator
+from evaluation.visualizations import EvaluationVisualizer
+from configs.config import EvaluationConfig
 
 # Import your existing components (adjust paths as needed)
 # from src.models.cql import ConservativeQLearning
@@ -149,191 +149,104 @@ def generate_evaluation_trajectories(
 
 def main_single_policy_evaluation():
     """
-    Example: Evaluate a single policy comprehensively.
+    Example: Evaluate a single policy comprehensively using the actual API.
     """
     print("=" * 80)
     print("SINGLE POLICY COMPREHENSIVE EVALUATION")
     print("=" * 80)
-    
-    # 1. Configuration
-    config = EvaluationFrameworkConfig(
-        output_dir='./evaluation_results/cql_policy',
-        ope_methods=['IS', 'WIS', 'DR', 'DM'],
-        run_safety_evaluation=True,
-        run_clinical_evaluation=True,
-        run_performance_evaluation=True,
-        run_ope_evaluation=True,
-        save_visualizations=True
-    )
-    
-    # 2. Load components
-    print("\nLoading policy and environment...")
-    policy = load_trained_policy('./checkpoints/cql_best.pth')
-    behavior_policy = load_behavior_policy('./checkpoints/behavior_policy.pth')
-    q_function = load_q_function('./checkpoints/q_function.pth')
-    
-    # Load environment (replace with your actual environment)
-    # environment = HealthcareMDP(config)
-    
-    # 3. Initialize evaluator
-    print("Initializing evaluator...")
-    evaluator = ComprehensiveEvaluator(
-        config=config,
-        q_function=q_function
-    )
-    
-    # 4. Generate evaluation trajectories
-    print("\nGenerating evaluation trajectories...")
-    # policy_trajectories = generate_evaluation_trajectories(
-    #     policy, environment, n_episodes=200
-    # )
-    
-    # For demonstration, load from saved trajectories
-    # policy_trajectories = load_saved_trajectories('./data/evaluation_trajs.pkl')
-    
-    # Dummy trajectories for demonstration
-    policy_trajectories = generate_dummy_trajectories(200)
-    baseline_trajectories = generate_dummy_trajectories(200)  # For comparison
-    
-    # 5. Run comprehensive evaluation
-    print("\nRunning comprehensive evaluation...")
-    results = evaluator.evaluate_policy(
-        policy_name='CQL',
-        policy=policy,
-        policy_trajectories=policy_trajectories,
-        behavior_policy=behavior_policy,
-        baseline_trajectories=baseline_trajectories,
-        training_curves=None  # Add if available
-    )
-    
-    # 6. Print summary
+
+    cfg = EvaluationConfig()
+
+    # Generate dummy trajectories in the expected dict format
+    trajs = generate_dummy_trajectories(50)
+
+    print("\nRunning safety evaluation...")
+    safety_result = SafetyEvaluator(cfg).evaluate(trajs)
+
+    print("\nRunning clinical evaluation...")
+    tir = ClinicalEvaluator(cfg).compute_time_in_range(trajs)
+
+    print("\nRunning performance evaluation...")
+    perf_result = PerformanceEvaluator(cfg).evaluate(trajs)
+
     print("\n" + "=" * 80)
     print("EVALUATION SUMMARY")
     print("=" * 80)
-    print(f"\nPolicy: {results['summary']['policy_name']}")
-    print(f"Trajectories: {results['summary']['n_trajectories']}")
     print(f"\nPerformance:")
-    print(f"  Average Return: {results['summary'].get('average_return', 'N/A'):.3f}")
-    print(f"  Success Rate: {results['summary'].get('success_rate', 'N/A'):.3f}")
+    print(f"  Average Return: {perf_result.average_return:.3f}")
+    print(f"  Success Rate:   {perf_result.success_rate:.3f}")
     print(f"\nSafety:")
-    print(f"  Safety Index: {results['summary'].get('safety_index', 'N/A'):.3f}")
-    print(f"  Safety Passed: {results['summary'].get('safety_passed', 'N/A')}")
-    print(f"  Overall Safety Score: {results['summary'].get('overall_safety_score', 'N/A'):.3f}")
-    print(f"\nClinical:")
-    print(f"  Overall Clinical Score: {results['summary'].get('overall_clinical_score', 'N/A'):.3f}")
-    print(f"  Adverse Event Rate: {results['summary'].get('adverse_event_rate', 'N/A'):.3f}")
-    
-    if 'ope_comparison' in results['summary']:
-        print(f"\nOff-Policy Evaluation:")
-        print(f"  Mean of Estimates: {results['summary']['ope_mean_of_means']:.3f}")
-        print(f"  Agreement StdDev: {results['summary']['ope_agreement_std']:.3f}")
-    
-    print("\n" + "=" * 80)
-    print(f"\nDetailed results saved to: {config.output_dir}")
-    print(f"Visualizations saved to: {config.output_dir}/visualizations")
+    print(f"  Safety Index:   {safety_result.safety_index:.3f}")
+    print(f"  Violation Rate: {safety_result.violation_rate:.3f}")
+    print(f"\nClinical (Time-in-Range):")
+    for metric, val in tir.items():
+        print(f"  {metric}: {val:.3f}")
+    print("=" * 80)
 
 
 def main_multi_policy_comparison():
     """
-    Example: Compare multiple policies.
+    Example: Compare multiple policies side-by-side.
     """
     print("=" * 80)
     print("MULTI-POLICY COMPARISON")
     print("=" * 80)
-    
-    # 1. Configuration
-    config = EvaluationFrameworkConfig(
-        output_dir='./evaluation_results/comparison',
-        run_safety_evaluation=True,
-        run_clinical_evaluation=True,
-        save_visualizations=True
-    )
-    
-    # 2. Initialize evaluator
-    print("\nInitializing evaluator...")
-    evaluator = ComprehensiveEvaluator(config=config)
-    
-    # 3. Load policies and generate trajectories
-    policies = {
-        'CQL': {
-            'policy': load_trained_policy('./checkpoints/cql_best.pth'),
-            'trajectories': generate_dummy_trajectories(200),
-            'training_curves': np.random.randn(1000).cumsum().tolist()
-        },
-        'BCQ': {
-            'policy': load_trained_policy('./checkpoints/bcq_best.pth'),
-            'trajectories': generate_dummy_trajectories(200),
-            'training_curves': np.random.randn(1000).cumsum().tolist()
-        },
-        'Behavior_Cloning': {
-            'policy': load_trained_policy('./checkpoints/bc_best.pth'),
-            'trajectories': generate_dummy_trajectories(200),
-            'training_curves': np.random.randn(1000).cumsum().tolist()
-        },
-        'Random': {
-            'policy': load_trained_policy('./checkpoints/random.pth'),
-            'trajectories': generate_dummy_trajectories(200)
-        }
-    }
-    
-    # 4. Run comparison
-    print("\nComparing policies...")
-    comparison_df = evaluator.compare_policies(
-        policies,
-        baseline_name='Random'
-    )
-    
-    # 5. Display results
+
+    cfg = EvaluationConfig()
+    policy_names = ["CQL", "BCQ", "BehaviorCloning", "Random"]
+
+    print("\nEvaluating policies...")
+    rows = []
+    for name in policy_names:
+        trajs = generate_dummy_trajectories(50)
+        safety = SafetyEvaluator(cfg).evaluate(trajs)
+        perf   = PerformanceEvaluator(cfg).evaluate(trajs)
+        rows.append({
+            "Policy":          name,
+            "Avg Return":      round(perf.average_return, 3),
+            "Success Rate":    round(perf.success_rate, 3),
+            "Safety Index":    round(safety.safety_index, 3),
+            "Violation Rate":  round(safety.violation_rate, 3),
+        })
+
     print("\n" + "=" * 80)
     print("COMPARISON RESULTS")
     print("=" * 80)
-    print("\n", comparison_df.to_string())
-    
-    # Print best policy
-    if 'overall_rank' in comparison_df.columns:
-        best_policy = comparison_df['overall_rank'].idxmin()
-        print(f"\n\nBest Policy: {best_policy}")
-        print(f"Overall Rank: {comparison_df.loc[best_policy, 'overall_rank']:.3f}")
+    header = f"{'Policy':<20} {'Avg Return':>12} {'Success':>10} {'Safety':>10} {'Violations':>12}"
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        print(f"{r['Policy']:<20} {r['Avg Return']:>12.3f} {r['Success Rate']:>10.3f}"
+              f" {r['Safety Index']:>10.3f} {r['Violation Rate']:>12.3f}")
+    print("=" * 80)
 
 
-def generate_dummy_trajectories(n_episodes: int) -> List[List[Tuple]]:
+def generate_dummy_trajectories(n_episodes: int, episode_length: int = 30) -> List[dict]:
     """
     Generate dummy trajectories for demonstration.
-    
-    Replace this with actual trajectory generation from your environment.
+
+    Returns list of trajectory dicts:
+        {'states': [...], 'actions': [...], 'rewards': [...],
+         'next_states': [...], 'dones': [...]}
     """
     trajectories = []
-    
     for _ in range(n_episodes):
-        episode_length = np.random.randint(50, 200)
-        trajectory = []
-        
+        states, actions, rewards, next_states, dones = [], [], [], [], []
         for t in range(episode_length):
-            # Dummy state (you would use actual patient state)
             state = {
-                'glucose': np.random.uniform(70, 180),
-                'blood_pressure_systolic': np.random.uniform(90, 140),
-                'blood_pressure_diastolic': np.random.uniform(60, 90),
-                'hba1c': np.random.uniform(5, 7),
-                'adherence_score': np.random.uniform(0.5, 1.0)
+                'glucose': float(np.random.uniform(70, 180)),
+                'blood_pressure_systolic': float(np.random.uniform(90, 140)),
+                'adherence_score': float(np.random.uniform(0.5, 1.0)),
             }
-            
-            # Dummy action
-            action = np.random.randn(5)
-            
-            # Dummy reward
-            reward = np.random.randn()
-            
-            # Dummy next state
-            next_state = state.copy()
-            
-            # Done flag
-            done = (t == episode_length - 1)
-            
-            trajectory.append((state, action, reward, next_state, done))
-        
-        trajectories.append(trajectory)
-    
+            next_states.append({k: float(np.random.uniform(70, 180)) if k == 'glucose'
+                                 else float(v * 0.95 + np.random.randn() * 0.01)
+                                 for k, v in state.items()})
+            states.append(state)
+            actions.append(np.random.uniform(0, 1, size=1))
+            rewards.append(float(np.random.randn()))
+            dones.append(t == episode_length - 1)
+        trajectories.append({'states': states, 'actions': actions,
+                              'rewards': rewards, 'next_states': next_states, 'dones': dones})
     return trajectories
 
 

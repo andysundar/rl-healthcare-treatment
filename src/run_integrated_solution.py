@@ -62,6 +62,14 @@ from models.baselines import (
     compare_all_baselines,
 )
 
+# Optional imports for new stages (imported lazily inside stage methods to
+# keep the default run path unaffected)
+# from models.encoders import PatientAutoencoder, EncoderConfig
+# from models.encoders.state_encoder_wrapper import StateEncoderWrapper
+# from models.policy_transfer import PolicyTransferTrainer, TransferConfig
+# from evaluation.interpretability import (InterpretabilityConfig,
+#     CounterfactualExplainer, DecisionRuleExtractor, PersonalizationScorer)
+
 
 # Configure logging
 logging.basicConfig(
@@ -112,6 +120,9 @@ class IntegratedSolutionRunner:
         if self.config.mode in ['full', 'train-eval', 'synthetic']:
             self.stage_2_environment_setup()
 
+        # Encoder pre-training (opt-in)
+        self.stage_2b_encoder_training()
+
         if self.config.mode in ['full', 'train-eval', 'synthetic']:
             self.stage_3_baseline_training()
 
@@ -120,6 +131,12 @@ class IntegratedSolutionRunner:
 
         if self.config.mode in ['full', 'train-eval', 'eval-only']:
             self.stage_5_evaluation()
+
+        # Policy transfer (opt-in)
+        self.stage_6b_transfer()
+
+        # Interpretability (opt-in)
+        self.stage_7_interpretability()
 
         self.stage_6_generate_reports()
 
@@ -338,6 +355,73 @@ class IntegratedSolutionRunner:
         logger.info("Environment setup complete")
 
     # ------------------------------------------------------------------
+    # Stage 2b  (opt-in)
+    # ------------------------------------------------------------------
+
+    def stage_2b_encoder_training(self):
+        """Stage 2b: Pre-train state autoencoder (only if --use-encoder)."""
+        if not getattr(self.config, 'use_encoder', False):
+            return
+
+        logger.info("\n" + "=" * 80)
+        logger.info("STAGE 2b: ENCODER PRE-TRAINING")
+        logger.info("=" * 80)
+
+        if 'data' not in self.results:
+            logger.info("No data yet — generating synthetic data for encoder training...")
+            data = self.prepare_synthetic_data()
+            self.results['data'] = data
+        else:
+            data = self.results['data']
+
+        from models.encoders import PatientAutoencoder, EncoderConfig
+        from models.encoders.state_encoder_wrapper import StateEncoderWrapper
+
+        enc_cfg = EncoderConfig(
+            lab_dim=10,
+            vital_dim=0,
+            demo_dim=0,
+            state_dim=getattr(self.config, 'encoder_state_dim', 64),
+        )
+        variational = (getattr(self.config, 'encoder_type', 'autoencoder') == 'vae')
+        ae = PatientAutoencoder(enc_cfg, variational=variational)
+        device = self.get_device()
+        wrapper = StateEncoderWrapper(ae, device=device, raw_state_dim=10)
+
+        checkpoint = getattr(self.config, 'encoder_checkpoint', None)
+        if checkpoint:
+            logger.info(f"Loading encoder checkpoint from {checkpoint}")
+            wrapper.load_checkpoint(checkpoint)
+        else:
+            logger.info("Training encoder...")
+            enc_save_dir = self.output_dir / 'encoder'
+            history = wrapper.train_on_transitions(
+                train_transitions=data['train'],
+                val_transitions=data['val'],
+                epochs=getattr(self.config, 'encoder_epochs', 50),
+                save_dir=enc_save_dir,
+            )
+            logger.info(
+                f"Encoder training done. "
+                f"Final val loss: {history['val_loss'][-1]:.4f}"
+            )
+
+        logger.info("Re-encoding all transitions with trained encoder...")
+        encoded = {
+            split: wrapper.encode_transitions(data[split])
+            for split in ('train', 'val', 'test')
+        }
+
+        self.results['encoder_wrapper'] = wrapper
+        self.results['encoded_data'] = encoded
+        logger.info(
+            f"Encoded state dim: {wrapper.state_dim}  "
+            f"(train={len(encoded['train'])}, "
+            f"val={len(encoded['val'])}, "
+            f"test={len(encoded['test'])})"
+        )
+
+    # ------------------------------------------------------------------
     # Stage 3
     # ------------------------------------------------------------------
 
@@ -481,25 +565,85 @@ class IntegratedSolutionRunner:
             gamma=config.gamma,
         )
         device = self.get_device()
-
         logger.info(f"Training on device: {device}")
 
-        if data['source'] == 'synthetic':
+        # Prefer encoded data if encoder was pre-trained
+        if 'encoded_data' in self.results:
+            train_data = self.results['encoded_data']['train']
+            val_data   = self.results['encoded_data']['val']
+            state_dim  = self.results['encoder_wrapper'].state_dim
+            logger.info(f"Using encoder embeddings as states (dim={state_dim})")
+        elif data['source'] == 'synthetic':
             train_data = data['train']
+            val_data   = data['val']
+            state_dim  = 10
         else:
             train_data = self._convert_to_trajectory_format(data['train'])
+            val_data   = self._convert_to_trajectory_format(data['val'])
+            state_dim  = 10
+
+        # Rebuild agent with correct state_dim
+        agent = CQLAgent(
+            state_dim=state_dim,
+            action_dim=1,
+            hidden_dim=256,
+            q_lr=3e-4,
+            policy_lr=1e-4,
+            cql_alpha=5.0,
+            gamma=0.99,
+            device=str(device),
+        )
 
         logger.info(f"Training dataset size: {len(train_data)} transitions")
-        logger.info("Full CQL training requires src/models/rl — placeholder logged")
+
+        # Build replay buffer
+        from models.rl import ReplayBuffer, OfflineRLTrainer
+        from models.rl.trainer import create_simple_eval_function
+
+        buffer = ReplayBuffer(
+            capacity=len(train_data),
+            state_dim=state_dim,
+            action_dim=1,
+            device=str(device),
+        )
+        states      = np.array([t[0] for t in train_data], dtype=np.float32)
+        actions     = np.array([t[1] for t in train_data], dtype=np.float32)
+        rewards     = np.array([t[2] for t in train_data], dtype=np.float32)
+        next_states = np.array([t[3] for t in train_data], dtype=np.float32)
+        dones       = np.array([t[4] for t in train_data], dtype=np.float32)
+        buffer.load_from_dataset(states, actions, rewards, next_states, dones)
+
+        # Simple eval function from validation transitions
+        val_episodes = self._transitions_to_episodes(val_data)
+        eval_fn = create_simple_eval_function(val_episodes)
+
+        cql_save_dir = self.output_dir / 'cql'
+        n_iter  = getattr(self.config, 'cql_iterations', 10_000)
+        batch_sz = getattr(self.config, 'cql_batch_size', 256)
+
+        trainer = OfflineRLTrainer(
+            agent=agent,
+            replay_buffer=buffer,
+            save_dir=str(cql_save_dir),
+            eval_freq=max(1, n_iter // 10),
+            save_freq=max(1, n_iter // 5),
+        )
+        logger.info(f"Starting CQL training: {n_iter} iterations, batch={batch_sz}")
+        history = trainer.train(
+            num_iterations=n_iter,
+            batch_size=batch_sz,
+            eval_fn=eval_fn,
+            verbose=True,
+        )
 
         self.results['cql'] = {
             'config': config,
             'agent': agent,
-            'trained': False,
-            'note': 'CQL training placeholder',
+            'trained': True,
+            'history': history,
+            'state_dim': state_dim,
         }
-
-        logger.info("CQL setup complete (training placeholder)")
+        logger.info("CQL training complete")
 
     # ------------------------------------------------------------------
     # Stage 5
@@ -541,11 +685,13 @@ class IntegratedSolutionRunner:
         logger.info("\nComputing safety metrics...")
         eval_config = EvaluationConfig()
         safety_evaluator = SafetyEvaluator(eval_config)
+        # Evaluators expect dict-format trajectories; test_data is flat tuples
+        traj_dicts = self._tuples_to_traj_dicts(test_data)
         safety_results = {}
         for name, policy in baselines.items():
             logger.info(f"  {name}...")
             try:
-                safety_result = safety_evaluator.evaluate(test_data)
+                safety_result = safety_evaluator.evaluate(traj_dicts)
                 safety_index = safety_result.safety_index
                 safety_results[name] = {
                     'safety_index': safety_index,
@@ -566,7 +712,7 @@ class IntegratedSolutionRunner:
         for name, policy in baselines.items():
             logger.info(f"  {name}...")
             try:
-                tir = clinical_evaluator.compute_time_in_range(test_data)
+                tir = clinical_evaluator.compute_time_in_range(traj_dicts)
                 compliance = float(np.mean(list(tir.values()))) if tir else 0.0
                 clinical_results[name] = {'guideline_compliance': compliance}
             except Exception as e:
@@ -628,6 +774,28 @@ class IntegratedSolutionRunner:
                 },
             }
 
+        if 'cql' in self.results:
+            summary['cql'] = {
+                'trained': self.results['cql'].get('trained', False),
+                'state_dim': self.results['cql'].get('state_dim', 10),
+            }
+
+        if 'interpretability' in self.results:
+            interp = self.results['interpretability']
+            summary['interpretability'] = {
+                'decision_tree_fidelity': interp.get('decision_tree_fidelity'),
+                'n_rules': interp.get('n_rules'),
+                'n_counterfactuals': interp.get('n_counterfactuals'),
+                'personalization_score': interp.get('personalization_score'),
+                'rules_path': interp.get('rules_path'),
+                'counterfactuals_path': interp.get('counterfactuals_path'),
+            }
+
+        if 'transfer' in self.results:
+            summary['policy_transfer'] = {
+                'adapter_path': self.results['transfer'].get('adapter_path'),
+            }
+
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
 
@@ -637,6 +805,219 @@ class IntegratedSolutionRunner:
         self._generate_visualizations()
 
         logger.info("Report generation complete")
+
+    # ------------------------------------------------------------------
+    # Stage 6b  (opt-in)
+    # ------------------------------------------------------------------
+
+    def stage_6b_transfer(self):
+        """Stage 6b: Policy transfer to target population (only if --use-transfer)."""
+        if not getattr(self.config, 'use_transfer', False):
+            return
+
+        logger.info("\n" + "=" * 80)
+        logger.info("STAGE 6b: POLICY TRANSFER")
+        logger.info("=" * 80)
+
+        if not self.results.get('cql', {}).get('trained', False):
+            logger.warning("CQL agent not trained — skipping policy transfer")
+            return
+
+        from models.policy_transfer import PolicyTransferTrainer, TransferConfig
+
+        source_agent   = self.results['cql']['agent']
+        source_encoder = self.results.get('encoder_wrapper', None)
+        target_encoder = source_encoder   # same domain in synthetic mode
+
+        state_dim = self.results['cql']['state_dim']
+        tr_cfg = TransferConfig(
+            source_state_dim=state_dim,
+            target_state_dim=state_dim,
+            n_adaptation_steps=getattr(self.config, 'transfer_steps', 1_000),
+        )
+
+        trainer = PolicyTransferTrainer(
+            source_agent=source_agent,
+            source_encoder=source_encoder,
+            target_encoder=target_encoder,
+            config=tr_cfg,
+            device=self.get_device(),
+        )
+
+        data = self.results['data']
+        source_transitions = data['train']
+        target_transitions = data['test']   # treat test split as "target"
+
+        logger.info(
+            f"Fitting transfer adapter: "
+            f"{len(source_transitions)} source, "
+            f"{len(target_transitions)} target transitions"
+        )
+        history = trainer.fit(target_transitions, source_transitions)
+
+        adapter_path = self.output_dir / 'transfer_adapter.pt'
+        trainer.save(adapter_path)
+
+        self.results['transfer'] = {
+            'trainer': trainer,
+            'adapter_path': str(adapter_path),
+            'history': history,
+        }
+        logger.info(f"Transfer adapter saved to {adapter_path}")
+
+    # ------------------------------------------------------------------
+    # Stage 7  (opt-in)
+    # ------------------------------------------------------------------
+
+    def stage_7_interpretability(self):
+        """Stage 7: Interpretability analysis (only if --use-interpretability)."""
+        if not getattr(self.config, 'use_interpretability', False):
+            return
+
+        logger.info("\n" + "=" * 80)
+        logger.info("STAGE 7: INTERPRETABILITY")
+        logger.info("=" * 80)
+
+        if not self.results.get('cql', {}).get('trained', False):
+            logger.warning("CQL agent not trained — skipping interpretability")
+            return
+
+        from evaluation.interpretability import (
+            InterpretabilityConfig, CounterfactualExplainer,
+            DecisionRuleExtractor, PersonalizationScorer,
+        )
+
+        agent          = self.results['cql']['agent']
+        encoder_wrapper = self.results.get('encoder_wrapper', None)
+        device         = self.get_device()
+
+        data      = self.results['data']
+        test_data = self.results.get('encoded_data', data)['test']
+        raw_test  = data['test']          # always raw for counterfactuals
+
+        n_explain = getattr(self.config, 'explain_n_samples', 50)
+        max_depth = getattr(self.config, 'tree_max_depth', 4)
+        n_cf      = getattr(self.config, 'n_counterfactuals', 5)
+
+        interp_cfg = InterpretabilityConfig(
+            n_counterfactuals=n_cf,
+            tree_max_depth=max_depth,
+        )
+
+        # ---- Decision rules ------------------------------------------
+        logger.info("Fitting surrogate decision tree...")
+        test_states = np.array([t[0] for t in test_data], dtype=np.float32)
+        rule_extractor = DecisionRuleExtractor(interp_cfg)
+        rule_extractor.fit(
+            states=np.array([t[0] for t in raw_test], dtype=np.float32),
+            agent=agent,
+            encoder_wrapper=encoder_wrapper,
+        )
+        fidelity = rule_extractor.fidelity_score(
+            np.array([t[0] for t in raw_test[:500]], dtype=np.float32),
+            agent, encoder_wrapper,
+        )
+        logger.info(f"Decision tree fidelity: {fidelity:.4f}")
+
+        rules_path = self.output_dir / 'decision_rules.txt'
+        rule_extractor.save_rules(rules_path)
+        rules = rule_extractor.extract_rules()
+
+        # ---- Counterfactuals -----------------------------------------
+        logger.info(f"Generating counterfactuals for {n_explain} states...")
+        cf_explainer = CounterfactualExplainer(agent, encoder_wrapper, interp_cfg, device)
+        sample_states = raw_test[:n_explain]
+        all_cf = []
+        for transition in sample_states:
+            raw_state = transition[0]
+            cfs = cf_explainer.explain(raw_state)
+            all_cf.extend(cfs)
+
+        # Serialise (convert numpy arrays to lists for JSON)
+        cf_serialisable = []
+        for cf in all_cf:
+            cf_serialisable.append({
+                'original_action': cf['original_action'],
+                'new_action': cf['new_action'],
+                'l1_distance': cf['l1_distance'],
+                'feature_changes': cf['feature_changes'],
+            })
+
+        cf_path = self.output_dir / 'counterfactuals.json'
+        import json as _json
+        with open(cf_path, 'w') as fh:
+            _json.dump(cf_serialisable, fh, indent=2)
+        logger.info(f"Counterfactuals saved to {cf_path} ({len(all_cf)} total)")
+
+        # ---- Personalization score -----------------------------------
+        pers_score = None
+        if encoder_wrapper is not None:
+            logger.info("Computing personalization score...")
+            source_trajs = self._to_state_trajectories(data['train'])
+            target_trajs = self._to_state_trajectories(data['test'])
+            scorer = PersonalizationScorer(encoder_wrapper, encoder_wrapper)
+            pers_result = scorer.compute_batch(source_trajs, target_trajs)
+            pers_score = pers_result['mean']
+            logger.info(
+                f"Personalization score: {pers_score:.4f} "
+                f"+/- {pers_result['std']:.4f}"
+            )
+
+        self.results['interpretability'] = {
+            'decision_tree_fidelity': fidelity,
+            'n_rules': len(rules),
+            'n_counterfactuals': len(all_cf),
+            'personalization_score': pers_score,
+            'rules_path': str(rules_path),
+            'counterfactuals_path': str(cf_path),
+        }
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _transitions_to_episodes(self, transitions):
+        """
+        Group a flat list of (s, a, r, s', done) tuples into episode dicts
+        of the form {'states':[], 'actions':[], 'rewards':[], 'next_states':[]}.
+        Falls back to fixed-length chunks (trajectory_length) if no done flags.
+        """
+        episodes = []
+        current = {'states': [], 'actions': [], 'rewards': [], 'next_states': []}
+        has_done = any(t[4] for t in transitions)
+        chunk = getattr(self.config, 'trajectory_length', 30)
+
+        for i, (s, a, r, ns, done) in enumerate(transitions):
+            current['states'].append(s)
+            current['actions'].append(float(a) if np.ndim(a) == 0 else float(a[0]))
+            current['rewards'].append(float(r))
+            current['next_states'].append(ns)
+
+            end = done if has_done else ((i + 1) % chunk == 0)
+            if end and current['states']:
+                episodes.append(current)
+                current = {'states': [], 'actions': [], 'rewards': [], 'next_states': []}
+
+        if current['states']:
+            episodes.append(current)
+        return episodes
+
+    def _to_state_trajectories(self, transitions, chunk_size: int = 30):
+        """
+        Convert flat transitions into list-of-lists of raw state arrays,
+        grouped by episode (done flag) or fixed chunk_size.
+        """
+        trajs, current = [], []
+        has_done = any(t[4] for t in transitions)
+        for i, (s, a, r, ns, done) in enumerate(transitions):
+            current.append(s)
+            end = done if has_done else ((i + 1) % chunk_size == 0)
+            if end and current:
+                trajs.append(current)
+                current = []
+        if current:
+            trajs.append(current)
+        return trajs
 
     def _generate_latex_table(self):
         if 'baselines' not in self.results:
@@ -680,31 +1061,285 @@ class IntegratedSolutionRunner:
             import matplotlib.pyplot as plt
             import seaborn as sns
 
-            comparison = self.results['baselines']['comparison']
             sns.set_style('whitegrid')
+            plt.rcParams.update({'font.size': 11})
+            comparison = self.results['baselines']['comparison']
 
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            # ----------------------------------------------------------
+            # Fig 1: Baseline comparison (2 panels — reward + safety)
+            # ----------------------------------------------------------
+            fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+            colors = sns.color_palette('muted', len(comparison))
 
-            axes[0].barh(comparison.index, comparison['mean_reward'])
+            axes[0].barh(comparison.index, comparison['mean_reward'], color=colors)
             axes[0].set_xlabel('Mean Reward')
-            axes[0].set_title('Baseline Policy Comparison - Mean Reward')
+            axes[0].set_title('Policy Comparison — Mean Reward')
             axes[0].grid(axis='x', alpha=0.3)
 
-            axes[1].barh(comparison.index, comparison['safety_rate'])
+            axes[1].barh(comparison.index, comparison['safety_rate'], color=colors)
             axes[1].set_xlabel('Safety Rate')
-            axes[1].set_title('Baseline Policy Comparison - Safety Rate')
+            axes[1].set_title('Policy Comparison — Safety Rate')
+            axes[1].set_xlim(0, 1.05)
             axes[1].grid(axis='x', alpha=0.3)
 
             plt.tight_layout()
-
-            plot_path = self.output_dir / 'baseline_comparison.png'
-            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            path1 = self.output_dir / 'baseline_comparison.png'
+            plt.savefig(path1, dpi=300, bbox_inches='tight')
             plt.close()
+            logger.info(f"Saved {path1}")
 
-            logger.info(f"Visualization saved to {plot_path}")
+            # ----------------------------------------------------------
+            # Fig 2: 4-panel policy dashboard
+            # ----------------------------------------------------------
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            metrics = [
+                ('mean_reward',       'Mean Reward',        axes[0, 0]),
+                ('safety_rate',       'Safety Rate',        axes[0, 1]),
+                ('mean_action_value', 'Mean Action Value',  axes[1, 0]),
+                ('std_action_value',  'Action Std Dev',     axes[1, 1]),
+            ]
+            for col, title, ax in metrics:
+                if col in comparison.columns:
+                    vals = comparison[col]
+                    bars = ax.bar(range(len(vals)), vals,
+                                  color=sns.color_palette('muted', len(vals)))
+                    ax.set_xticks(range(len(vals)))
+                    ax.set_xticklabels(comparison.index, rotation=30, ha='right', fontsize=9)
+                    ax.set_title(title)
+                    ax.grid(axis='y', alpha=0.3)
+                    # Label bars
+                    for bar, v in zip(bars, vals):
+                        ax.text(bar.get_x() + bar.get_width() / 2,
+                                bar.get_height() + 0.001 * abs(bar.get_height() + 1e-9),
+                                f'{v:.3f}', ha='center', va='bottom', fontsize=8)
+
+            fig.suptitle('Policy Performance Dashboard', fontsize=14, fontweight='bold', y=1.01)
+            plt.tight_layout()
+            path2 = self.output_dir / 'policy_dashboard.png'
+            plt.savefig(path2, dpi=300, bbox_inches='tight')
+            plt.close()
+            logger.info(f"Saved {path2}")
+
+            # ----------------------------------------------------------
+            # Fig 2b: comparison.png  (EvaluationVisualizer style)
+            # ----------------------------------------------------------
+            try:
+                from evaluation.visualizations import EvaluationVisualizer
+                from configs.config import EvaluationConfig as _EvalCfg
+                viz = EvaluationVisualizer(_EvalCfg())
+                path_comp = self.output_dir / 'comparison.png'
+                viz.plot_comparison(
+                    comparison,
+                    metrics=['mean_reward', 'safety_rate'],
+                    save_path=str(path_comp),
+                )
+                plt.close('all')
+                logger.info(f"Saved {path_comp}")
+            except Exception as _e:
+                logger.warning(f"comparison.png skipped: {_e}")
+
+            # ----------------------------------------------------------
+            # Fig 2c: health_metrics.png  (glucose + adherence over time)
+            # ----------------------------------------------------------
+            try:
+                test_data = self.results['baselines']['test_data']
+                traj_dicts = self._tuples_to_traj_dicts(test_data)
+                if traj_dicts:
+                    from evaluation.visualizations import EvaluationVisualizer
+                    from configs.config import EvaluationConfig as _EvalCfg2
+                    viz2 = EvaluationVisualizer(_EvalCfg2())
+                    path_hm = self.output_dir / 'health_metrics.png'
+                    viz2.plot_health_metrics(
+                        traj_dicts,
+                        metrics=['glucose', 'adherence_score'],
+                        save_path=str(path_hm),
+                    )
+                    plt.close('all')
+                    logger.info(f"Saved {path_hm}")
+            except Exception as _e:
+                logger.warning(f"health_metrics.png skipped: {_e}")
+
+            # ----------------------------------------------------------
+            # Fig 3: CQL training curves (only if CQL was trained)
+            # ----------------------------------------------------------
+            if self.results.get('cql', {}).get('trained', False):
+                history = self.results['cql'].get('history', {})
+                train_losses = history.get('train_losses', [])
+                eval_returns = history.get('eval_returns', [])
+
+                n_panels = (1 if not train_losses else 1) + (1 if not eval_returns else 1)
+                plot_items = []
+                if train_losses:
+                    plot_items.append(('Training Loss', train_losses, 'Iteration', 'Loss'))
+                if eval_returns:
+                    plot_items.append(('Eval Return', eval_returns, 'Eval Step', 'Return'))
+
+                if plot_items:
+                    fig, axes = plt.subplots(1, len(plot_items), figsize=(6 * len(plot_items), 5))
+                    if len(plot_items) == 1:
+                        axes = [axes]
+                    for ax, (title, vals, xlabel, ylabel) in zip(axes, plot_items):
+                        ax.plot(vals, linewidth=2, color='steelblue')
+                        ax.set_title(title)
+                        ax.set_xlabel(xlabel)
+                        ax.set_ylabel(ylabel)
+                        ax.grid(alpha=0.3)
+                    fig.suptitle('CQL Training Dynamics', fontsize=13, fontweight='bold')
+                    plt.tight_layout()
+                    path3 = self.output_dir / 'cql_training_curves.png'
+                    plt.savefig(path3, dpi=300, bbox_inches='tight')
+                    plt.close()
+                    logger.info(f"Saved {path3}")
+
+            # ----------------------------------------------------------
+            # Fig 4: Feature importance (only if interpretability ran)
+            # ----------------------------------------------------------
+            if 'interpretability' in self.results:
+                import json as _json
+                rules_json = self.results['interpretability'].get('rules_path', '')
+                if rules_json:
+                    fi_path = str(rules_json).replace('.txt', '.json')
+                    try:
+                        with open(fi_path) as fh:
+                            fi = _json.load(fh)
+                        # Sort descending
+                        fi_sorted = dict(sorted(fi.items(), key=lambda x: x[1], reverse=True))
+                        if any(v > 0 for v in fi_sorted.values()):
+                            fig, ax = plt.subplots(figsize=(9, 5))
+                            bars = ax.barh(list(fi_sorted.keys()),
+                                           list(fi_sorted.values()),
+                                           color=sns.color_palette('viridis', len(fi_sorted)))
+                            ax.set_xlabel('Feature Importance')
+                            ax.set_title('Surrogate Decision Tree — Feature Importances\n'
+                                         f'(Fidelity: {self.results["interpretability"].get("decision_tree_fidelity", 0):.3f})')
+                            ax.grid(axis='x', alpha=0.3)
+                            plt.tight_layout()
+                            path4 = self.output_dir / 'feature_importance.png'
+                            plt.savefig(path4, dpi=300, bbox_inches='tight')
+                            plt.close()
+                            logger.info(f"Saved {path4}")
+                    except Exception as e:
+                        logger.warning(f"Feature importance chart skipped: {e}")
+
+                # Personalization score card
+                ps = self.results['interpretability'].get('personalization_score')
+                if ps is not None:
+                    fig, ax = plt.subplots(figsize=(5, 3))
+                    ax.barh(['Personalization\nScore'], [ps],
+                            color='mediumseagreen' if ps > 0.5 else 'salmon')
+                    ax.set_xlim(-1, 1)
+                    ax.axvline(0, color='gray', linewidth=0.8, linestyle='--')
+                    ax.set_title(f'PDF §7.2 Personalization Score = {ps:.4f}',
+                                 fontsize=12, fontweight='bold')
+                    ax.set_xlabel('Cosine Similarity')
+                    ax.grid(axis='x', alpha=0.3)
+                    plt.tight_layout()
+                    path5 = self.output_dir / 'personalization_score.png'
+                    plt.savefig(path5, dpi=300, bbox_inches='tight')
+                    plt.close()
+                    logger.info(f"Saved {path5}")
+
+            # ----------------------------------------------------------
+            # Fig 5: Evaluation summary heatmap (safety + clinical)
+            # ----------------------------------------------------------
+            if 'evaluation' in self.results:
+                safety  = self.results['evaluation']['safety']
+                clinical = self.results['evaluation']['clinical']
+                policies = [p for p in safety if safety[p] is not None]
+                if policies:
+                    safety_vals   = [safety[p]['safety_index']           if safety[p]   else 0.0 for p in policies]
+                    clinical_vals = [clinical[p]['guideline_compliance']  if clinical[p] else 0.0 for p in policies]
+                    heat_data = np.array([safety_vals, clinical_vals])
+                    fig, ax = plt.subplots(figsize=(max(8, len(policies) * 1.2), 3.5))
+                    im = ax.imshow(heat_data, aspect='auto', cmap='RdYlGn', vmin=0, vmax=1)
+                    ax.set_xticks(range(len(policies)))
+                    ax.set_xticklabels(policies, rotation=30, ha='right', fontsize=9)
+                    ax.set_yticks([0, 1])
+                    ax.set_yticklabels(['Safety Index', 'Guideline Compliance'])
+                    for i in range(2):
+                        for j, p in enumerate(policies):
+                            v = heat_data[i, j]
+                            ax.text(j, i, f'{v:.2f}', ha='center', va='center',
+                                    fontsize=10, color='black' if 0.3 < v < 0.8 else 'white')
+                    plt.colorbar(im, ax=ax, fraction=0.03)
+                    ax.set_title('Safety & Clinical Metrics Heatmap')
+                    plt.tight_layout()
+                    path6 = self.output_dir / 'safety_clinical_heatmap.png'
+                    plt.savefig(path6, dpi=300, bbox_inches='tight')
+                    plt.close()
+                    logger.info(f"Saved {path6}")
+
+            # ----------------------------------------------------------
+            # Fig 6: Thesis summary PDF (combines all plots)
+            # ----------------------------------------------------------
+            try:
+                from matplotlib.backends.backend_pdf import PdfPages
+                pdf_path = self.output_dir / 'thesis_figures.pdf'
+                pngs = [p for p in self.output_dir.glob('*.png')
+                        if p.name != 'thesis_figures.pdf']
+                if pngs:
+                    with PdfPages(pdf_path) as pdf:
+                        for png in sorted(pngs):
+                            img = plt.imread(str(png))
+                            fig, ax = plt.subplots(
+                                figsize=(img.shape[1] / 100, img.shape[0] / 100)
+                            )
+                            ax.imshow(img)
+                            ax.axis('off')
+                            ax.set_title(png.stem.replace('_', ' ').title(),
+                                         fontsize=11, pad=8)
+                            pdf.savefig(fig, bbox_inches='tight')
+                            plt.close(fig)
+                    logger.info(f"Saved thesis PDF: {pdf_path}")
+            except Exception as e:
+                logger.warning(f"Thesis PDF generation failed: {e}")
 
         except Exception as e:
-            logger.warning(f"Visualization generation failed: {e}")
+            logger.warning(f"Visualization generation failed: {e}", exc_info=True)
+
+    def _tuples_to_traj_dicts(self, flat_transitions):
+        """Convert flat list of (s, a, r, s', done) tuples to trajectory dicts.
+
+        The evaluators (SafetyEvaluator, ClinicalEvaluator, EvaluationVisualizer)
+        expect trajectories in the dict format:
+            {'states': [state_dict, ...], 'actions': [...], 'rewards': [...],
+             'next_states': [state_dict, ...], 'dones': [...]}
+
+        Each state dict maps feature names to float values.  The synthetic state
+        vector uses these 10 columns in order.  The evaluators look for keys
+        'glucose' and 'bp_systolic', so we add aliases.
+        """
+        STATE_COLS = [
+            'glucose_mean', 'glucose_std', 'glucose_min', 'glucose_max',
+            'insulin_mean', 'medication_taken', 'reminder_sent',
+            'hypoglycemia', 'hyperglycemia', 'day',
+        ]
+
+        def _vec_to_dict(vec):
+            d = {k: float(v) for k, v in zip(STATE_COLS, vec)}
+            d['glucose']                  = d['glucose_mean']
+            d['bp_systolic']              = 120.0   # not in synthetic; safe constant
+            d['blood_pressure_systolic']  = 120.0
+            d['adherence_score']          = d['medication_taken']
+            return d
+
+        trajectories = []
+        current = {'states': [], 'actions': [], 'rewards': [],
+                   'next_states': [], 'dones': []}
+        for item in flat_transitions:
+            s, a, r, ns, done = item
+            current['states'].append(_vec_to_dict(s))
+            current['actions'].append(a)
+            current['rewards'].append(float(r))
+            current['next_states'].append(_vec_to_dict(ns))
+            current['dones'].append(bool(done))
+            if done:
+                trajectories.append(current)
+                current = {'states': [], 'actions': [], 'rewards': [],
+                           'next_states': [], 'dones': []}
+        if current['states']:
+            trajectories.append(current)
+        return trajectories
 
     def _convert_to_trajectory_format(self, df):
         logger.warning("Trajectory conversion not implemented - using placeholder")
@@ -734,6 +1369,43 @@ def parse_arguments():
     parser.add_argument('--use-sample', action='store_true')
     parser.add_argument('--sample-size', type=int, default=100)
     parser.add_argument('--train-cql', action='store_true')
+
+    # Encoder flags
+    parser.add_argument('--use-encoder', action='store_true',
+                        help='Pre-train a state autoencoder and use embeddings as RL state')
+    parser.add_argument('--encoder-state-dim', type=int, default=64,
+                        help='Latent dimension of the state encoder')
+    parser.add_argument('--encoder-epochs', type=int, default=50,
+                        help='Number of epochs to train the encoder')
+    parser.add_argument('--encoder-type', choices=['autoencoder', 'vae'],
+                        default='autoencoder',
+                        help='Type of encoder: standard autoencoder or VAE')
+    parser.add_argument('--encoder-checkpoint', type=str, default=None,
+                        help='Path to pre-trained encoder checkpoint (skips training)')
+
+    # CQL training flags
+    parser.add_argument('--cql-iterations', type=int, default=10_000,
+                        help='Number of CQL training iterations')
+    parser.add_argument('--cql-batch-size', type=int, default=256,
+                        help='Batch size for CQL training')
+
+    # Policy transfer flags
+    parser.add_argument('--use-transfer', action='store_true',
+                        help='Adapt source policy to target population')
+    parser.add_argument('--transfer-steps', type=int, default=1_000,
+                        help='Number of adapter training steps')
+    parser.add_argument('--target-data-dir', type=str, default=None,
+                        help='Directory with target-population data (optional)')
+
+    # Interpretability flags
+    parser.add_argument('--use-interpretability', action='store_true',
+                        help='Run counterfactual and decision-tree analysis')
+    parser.add_argument('--n-counterfactuals', type=int, default=5,
+                        help='Counterfactuals per state')
+    parser.add_argument('--tree-max-depth', type=int, default=4,
+                        help='Max depth for surrogate decision tree')
+    parser.add_argument('--explain-n-samples', type=int, default=50,
+                        help='Number of test states to explain')
 
     return parser.parse_args()
 

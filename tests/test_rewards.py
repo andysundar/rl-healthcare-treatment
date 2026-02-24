@@ -7,13 +7,13 @@ import pytest
 import numpy as np
 from typing import Dict, Any
 
-from .reward_config import RewardConfig
-from .adherence_reward import AdherenceReward
-from .health_reward import HealthOutcomeReward
-from .safety_reward import SafetyPenalty
-from .cost_reward import CostEffectivenessReward
-from .composite_reward import CompositeRewardFunction
-from .reward_shaping import (
+from rewards.reward_config import RewardConfig
+from rewards.adherence_reward import AdherenceReward
+from rewards.health_reward import HealthOutcomeReward
+from rewards.safety_reward import SafetyPenalty
+from rewards.cost_reward import CostEffectivenessReward
+from rewards.composite_reward import CompositeRewardFunction
+from rewards.reward_shaping import (
     normalize_reward,
     clip_reward,
     potential_based_shaping,

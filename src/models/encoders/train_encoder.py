@@ -16,9 +16,9 @@ import logging
 from tqdm import tqdm
 import json
 
-from base_encoder import BasePatientEncoder
-from autoencoder import PatientAutoencoder
-from transformer_encoder import TransformerPatientEncoder
+from .base_encoder import BasePatientEncoder
+from .autoencoder import PatientAutoencoder
+from .transformer_encoder import TransformerPatientEncoder
 
 
 logger = logging.getLogger(__name__)
@@ -238,7 +238,7 @@ class EncoderTrainer:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         
         logger.info(f"Loading checkpoint from: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         # Load model state
         self.encoder.load_state_dict(checkpoint['model_state_dict'])

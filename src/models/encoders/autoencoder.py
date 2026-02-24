@@ -12,9 +12,9 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 import logging
 
-from base_encoder import BasePatientEncoder
-from encoder_config import EncoderConfig
-from encoder_utils import initialize_weights
+from .base_encoder import BasePatientEncoder
+from .encoder_config import EncoderConfig
+from .encoder_utils import initialize_weights
 
 
 logger = logging.getLogger(__name__)

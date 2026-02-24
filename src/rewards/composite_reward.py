@@ -142,8 +142,10 @@ class CompositeRewardFunction(BaseRewardFunction):
         
         # Get each component's breakdown
         for name, reward_fn in self.components.items():
+            raw_total = reward_fn.compute_reward(state, action, next_state)
+            breakdown[f'{name}_total'] = raw_total
             component_breakdown = reward_fn.get_reward_components(state, action, next_state)
-            
+
             # Prefix with component name to avoid collisions
             for key, value in component_breakdown.items():
                 breakdown[f'{name}_{key}'] = value
@@ -207,10 +209,10 @@ class CompositeRewardFunction(BaseRewardFunction):
         min_val = self.component_ranges[component_name]['min']
         max_val = self.component_ranges[component_name]['max']
         
-        # Avoid division by zero
+        # Not enough range to normalize — pass raw value through
         if abs(max_val - min_val) < 1e-8:
-            return 0.0
-        
+            return value
+
         # Normalize to [-1, 1]
         normalized = 2.0 * (value - min_val) / (max_val - min_val) - 1.0
         return np.clip(normalized, -1.0, 1.0)
