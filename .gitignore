@@ -210,3 +210,4 @@ __marimo__/
 ## General Git Ignore Patterns
 .DS_Store
 outputs/
+integration_run.log

@@ -8,7 +8,7 @@ import torch
 import sys
 sys.path.append('..')
 
-from src.models.safety import (
+from models.safety import (
     SafetyConfig,
     SafetyLayer,
     SafeRLAgent,
