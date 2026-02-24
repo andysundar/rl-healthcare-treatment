@@ -38,12 +38,15 @@ from rewards import (
 )
 
 from evaluation import (
-    OffPolicyEvaluator
+    OffPolicyEvaluator,
+    SafetyEvaluator,
+    ClinicalEvaluator
 )
 
 from data import SyntheticDataGenerator
 
-from models.rl import CQLConfig
+from models.rl import CQLConfig, CQLAgent
+
 
 from models.baselines import (
             create_diabetes_rule_policy,
@@ -263,7 +266,7 @@ class IntegratedSolutionRunner:
                 final_cohort,
                 min(self.config.sample_size, len(final_cohort))
             )
-            logger.info(f"⚠ Using sample of {len(final_cohort)} patients")
+            logger.info(f" Using sample of {len(final_cohort)} patients")
         
         # Load patient data
         labs = loader.load_lab_events(subject_ids=final_cohort)
@@ -494,9 +497,11 @@ class IntegratedSolutionRunner:
         
         # Configure CQL
         logger.info("Configuring CQL...")
+        state_dim = 10
+        action_dim = 1
         config = CQLConfig(
-            state_dim=10,
-            action_dim=1,
+            state_dim=state_dim,
+            action_dim=action_dim,
             hidden_dim=256,
             q_lr=3e-4,
             policy_lr=1e-4,
@@ -505,7 +510,15 @@ class IntegratedSolutionRunner:
         )
         
         # Initialize agent
-        agent = ConservativeQLearning(config)
+        agent = CQLAgent(
+            state_dim=config.state_dim,
+            action_dim=config.action_dim,
+            hidden_dim=config.hidden_dim,
+            q_lr=config.q_lr,
+            policy_lr=config.policy_lr,
+            cql_alpha=config.cql_alpha,
+            gamma=config.gamma
+        )
         device = self.get_device()
         
         logger.info(f"Training on device: {device}")
@@ -552,13 +565,20 @@ class IntegratedSolutionRunner:
         logger.info("Running off-policy evaluation...")
         evaluator = OffPolicyEvaluator()
         
+        # Use behavior cloning as behavior policy (the policy that generated trajectories)
+        behavior_policy = baselines.get('Behavior-Cloning')
+        if behavior_policy is None:
+            logger.warning("Behavior policy not available, using first baseline as behavior policy")
+            behavior_policy = next(iter(baselines.values()))
+        
         ope_results = {}
         for name, policy in baselines.items():
             logger.info(f"  Evaluating {name}...")
             try:
-                results = evaluator.evaluate_policy(
+                results = evaluator.evaluate(
+                    trajectories=test_data,
                     policy=policy,
-                    dataset=test_data,
+                    behavior_policy=behavior_policy,
                     methods=['WIS', 'DR', 'DM']
                 )
                 ope_results[name] = results
@@ -568,7 +588,8 @@ class IntegratedSolutionRunner:
         
         # Safety metrics
         logger.info("\nComputing safety metrics...")
-        safety = SafetyMetrics()
+
+        safety = SafetyEvaluator(config=safety_config)
         
         safety_results = {}
         for name, policy in baselines.items():
@@ -588,16 +609,16 @@ class IntegratedSolutionRunner:
         
         # Clinical metrics (simplified)
         logger.info("\nComputing clinical metrics...")
-        clinical = ClinicalMetrics()
+        clinical = ClinicalEvaluator()
         
         clinical_results = {}
         for name, policy in baselines.items():
             logger.info(f"  {name}...")
             try:
                 # Compute guideline compliance
-                compliance = clinical.compute_guideline_compliance(
-                    policy=policy,
-                    test_data=test_data
+                compliance = clinical.compute_health_improvement(
+                    policy_trajectories=policy,
+                    baseline_trajectories=test_data
                 )
                 clinical_results[name] = {
                     'guideline_compliance': compliance

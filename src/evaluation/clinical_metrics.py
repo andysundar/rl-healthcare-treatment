@@ -24,7 +24,7 @@ class ClinicalResult:
     adverse_event_rate: float
     goal_achievement_rate: float
     clinical_significance: Dict[str, bool]
-    metadata: Dict = None
+    metadata: Optional[Dict] = None
 
 
 class ClinicalEvaluator:
