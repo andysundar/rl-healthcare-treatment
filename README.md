@@ -29,6 +29,8 @@ This project develops a **safety-constrained offline reinforcement learning fram
 | Counterfactual & decision-rule interpretability | `src/evaluation/interpretability.py` |
 | Personalisation score (PDF §7.2) | `src/evaluation/interpretability.py` |
 | Domain-adaptation policy transfer | `src/models/policy_transfer/transfer.py` |
+| Extended state: vital signs from CHARTEVENTS | `src/data/mimic_loader.py` (`--use-vitals`) |
+| Extended state: medication history | `src/data/mimic_loader.py` (`--use-med-history`) |
 | Thesis-quality visualisation artefacts | `src/run_integrated_solution.py` |
 
 ---
@@ -42,7 +44,23 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Smoke test — verify installation (< 30 s)
+### 2. Use the interactive script (recommended)
+
+```bash
+chmod +x quick_start.sh && ./quick_start.sh
+```
+
+Presents a numbered menu of 7 run scenarios (synthetic → full MIMIC-III).
+To run a specific scenario non-interactively:
+
+```bash
+./quick_start.sh --mode 1   # quick demo (<2 min)
+./quick_start.sh --mode 4   # extended state (vitals + med-history)
+./quick_start.sh --mode 5   # full pipeline (~60 min)
+./quick_start.sh --help     # list all scenarios
+```
+
+### 3. Smoke test — verify installation (< 30 s)
 
 ```bash
 python src/run_integrated_solution.py \
@@ -56,10 +74,10 @@ python src/run_integrated_solution.py \
 
 ```bash
 # Fast subset (skips slow CQL / full-pipeline tests)
-python tests/test_pdf_alignment.py --quick
+python tests/test_alignment.py --quick
 
 # Full suite — 23 tests, includes CQL training and subprocess test
-python tests/test_pdf_alignment.py
+python tests/test_alignment.py
 ```
 
 Expected: `Ran 23 tests … OK`
@@ -184,21 +202,76 @@ python src/run_integrated_solution.py \
 
 ---
 
-### Scenario G — MIMIC-III data
+### Scenario G — Extended state: vitals + medication history
 
 ```bash
 python src/run_integrated_solution.py \
     --mode train-eval \
-    --data-source mimic \
-    --mimic-dir data/raw/mimic-iii \
+    --n-synthetic-patients 500 \
+    --trajectory-length 30 \
+    --use-vitals \
+    --use-med-history \
     --use-encoder \
+    --encoder-state-dim 64 \
     --train-cql \
-    --cql-iterations 20000 \
-    --output-dir outputs/mimic_run
+    --cql-iterations 10000 \
+    --output-dir outputs/extended_state
 ```
 
-Requires MIMIC-III access (see [PhysioNet](https://physionet.org/content/mimiciii/)).
-Expected CSV files: `PATIENTS.csv`, `ADMISSIONS.csv`, `DIAGNOSES_ICD.csv`, `LABEVENTS.csv`, `PRESCRIPTIONS.csv`.
+Expands the state vector from **10 → 16 dimensions**:
+
+| Flag | Added features | Dims |
+|---|---|---|
+| `--use-vitals` | `heart_rate`, `sbp`, `respiratory_rate`, `spo2` | +4 |
+| `--use-med-history` | `adherence_rate_7d`, `medication_count` | +2 |
+| Both | — | **16-dim total** |
+
+Vital features are physiologically correlated (HR rises during hypoglycaemia, SpO2 drops with hyperglycaemia, etc.).
+All downstream components (encoder, CQL, baselines) adapt automatically.
+
+---
+
+### Scenario H — MIMIC-III data (full pipeline)
+
+```bash
+python src/run_integrated_solution.py \
+    --mode train-eval \
+    --mimic-dir data/raw/mimic-iii \
+    --use-vitals \
+    --use-med-history \
+    --use-encoder \
+    --encoder-state-dim 64 \
+    --train-cql \
+    --cql-iterations 20000 \
+    --use-interpretability \
+    --explain-n-samples 100 \
+    --use-transfer \
+    --transfer-steps 1000 \
+    --output-dir outputs/mimic_full
+```
+
+Requires MIMIC-III credentialed access (see [PhysioNet](https://physionet.org/content/mimiciii/)).
+
+**Required CSV files** (place in `data/raw/mimic-iii/`):
+
+| File | Used for |
+|---|---|
+| `PATIENTS.csv` | Demographics, cohort selection |
+| `ADMISSIONS.csv` | Admission records |
+| `DIAGNOSES_ICD.csv` | ICD-9 diabetes cohort filter |
+| `LABEVENTS.csv` | Glucose and lab measurements |
+| `PRESCRIPTIONS.csv` | Insulin orders, medication history (`--use-med-history`) |
+| `CHARTEVENTS.csv` *(optional)* | Vital signs — required for `--use-vitals` (~35 GB) |
+
+> For a quick test without the full dataset, omit `--use-vitals` (skips CHARTEVENTS) or use a 100-patient sample:
+>
+> ```bash
+> python src/run_integrated_solution.py --mode train-eval \
+>     --mimic-dir data/raw/mimic-iii --use-sample --sample-size 100 \
+>     --train-cql --cql-iterations 5000 --output-dir outputs/mimic_sample
+> ```
+>
+> See `docs/MIMIC_DOWNLOAD_GUIDE.md` for download instructions.
 
 ---
 
@@ -211,6 +284,11 @@ Expected CSV files: `PATIENTS.csv`, `ADMISSIONS.csv`, `DIAGNOSES_ICD.csv`, `LABE
 --n-synthetic-patients  (default: 100)
 --trajectory-length  (default: 20)
 --output-dir         (default: outputs/run_<timestamp>)
+
+# Extended state dimensions
+--use-vitals         add heart_rate, sbp, respiratory_rate, spo2 to state (+4 dims)
+--use-med-history    add adherence_rate_7d, medication_count to state (+2 dims)
+                     (MIMIC: vitals from CHARTEVENTS; synthetic: physiologically correlated)
 
 # Encoder (PDF §3.1)
 --use-encoder        pre-train autoencoder and use embeddings as RL state
@@ -317,9 +395,15 @@ rl-healthcare-treatment/
 ## MDP Formulation
 
 ```
-State S:  [glucose_mean, glucose_std, glucose_min, glucose_max,
-           insulin_mean, medication_taken, reminder_sent,
-           hypoglycemia, hyperglycemia, day]   # 10-dim raw; 64-dim encoded
+State S (base, 10-dim):
+  [glucose_mean, glucose_std, glucose_min, glucose_max,
+   insulin_mean, medication_taken, reminder_sent,
+   hypoglycemia, hyperglycemia, day]
+
+  + --use-vitals    → heart_rate, sbp, respiratory_rate, spo2      (14-dim)
+  + --use-med-history → adherence_rate_7d, medication_count        (12-dim)
+  + both            →                                               (16-dim)
+  + --use-encoder   → encoded latent                                (64-dim default)
 
 Action A: continuous dosage ∈ [0, 1]
 
@@ -469,8 +553,20 @@ The test suite covers (T01–T23):
 ## MIMIC-III Access
 
 1. Complete CITI training and request credentialed access at <https://physionet.org/content/mimiciii/>
-2. Download and extract to `data/raw/mimic-iii/`
-3. Required files: `PATIENTS.csv`, `ADMISSIONS.csv`, `DIAGNOSES_ICD.csv`, `LABEVENTS.csv`, `PRESCRIPTIONS.csv`
+2. Download and place CSV files in `data/raw/mimic-iii/`
+3. See [docs/MIMIC_DOWNLOAD_GUIDE.md](docs/MIMIC_DOWNLOAD_GUIDE.md) for step-by-step download instructions
+
+**Required CSV files** for a base MIMIC run:
+`PATIENTS.csv`, `ADMISSIONS.csv`, `DIAGNOSES_ICD.csv`, `LABEVENTS.csv`, `PRESCRIPTIONS.csv`
+
+**Additionally needed** for `--use-vitals` (vital signs — HR, SBP, RR, SpO2):
+`CHARTEVENTS.csv` (~35 GB uncompressed)
+
+**Quick testing without MIMIC-III** — the pipeline generates realistic synthetic patient data automatically:
+
+```bash
+./quick_start.sh --mode 1   # no MIMIC-III needed
+```
 
 ---
 

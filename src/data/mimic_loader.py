@@ -298,7 +298,72 @@ class MIMICLoader:
         
         logger.info(f"Loaded {len(df):,} lab events")
         return df
-    
+
+    def load_chartevents(
+        self,
+        subject_ids: Optional[List[int]] = None,
+        hadm_ids: Optional[List[int]] = None,
+        item_ids: Optional[List[int]] = None,
+    ) -> pd.DataFrame:
+        """
+        Load CHARTEVENTS table with vital signs and clinical observations.
+
+        Mirrors load_lab_events() with chunked reading. CHARTEVENTS is
+        already flagged in LARGE_FILES so it always uses the chunked path.
+
+        Args:
+            subject_ids: Filter by specific patient IDs
+            hadm_ids: Filter by specific admission IDs
+            item_ids: Filter by specific chart item IDs (vital sign item IDs)
+
+        Returns:
+            DataFrame with vital sign rows including columns:
+            subject_id, hadm_id, itemid, charttime, value, valuenum,
+            valueuom (all lowercase).
+
+        Note:
+            CHARTEVENTS is ~2.5 GB. Always filter by subject_ids and/or
+            item_ids to limit memory usage. Recommended item IDs for the
+            standard vital set are returned by FeatureEngineer.extract_vitals_sequence().
+        """
+        logger.info("Loading CHARTEVENTS table")
+
+        csv_path = self.data_dir / 'CHARTEVENTS.csv'
+        if not csv_path.exists():
+            csv_path = self.data_dir / 'chartevents.csv'
+        if not csv_path.exists():
+            raise FileNotFoundError(f"CHARTEVENTS not found in {self.data_dir}")
+
+        logger.info(f"Reading CHARTEVENTS in chunks (chunk_size={self.chunk_size})")
+        chunks = []
+        for i, chunk in enumerate(
+            pd.read_csv(csv_path, chunksize=self.chunk_size, low_memory=False)
+        ):
+            chunk.columns = chunk.columns.str.lower()
+
+            if subject_ids is not None:
+                chunk = chunk[chunk['subject_id'].isin(subject_ids)]
+            if hadm_ids is not None:
+                chunk = chunk[chunk['hadm_id'].isin(hadm_ids)]
+            if item_ids is not None:
+                chunk = chunk[chunk['itemid'].isin(item_ids)]
+
+            if len(chunk) > 0:
+                chunks.append(chunk)
+
+            if (i + 1) % 10 == 0:
+                logger.info(f"Processed {(i + 1) * self.chunk_size:,} rows...")
+
+        if not chunks:
+            logger.warning("No chart events found matching filters")
+            return pd.DataFrame()
+
+        df = pd.concat(chunks, ignore_index=True)
+        df['charttime'] = pd.to_datetime(df['charttime'], errors='coerce')
+
+        logger.info(f"Loaded {len(df):,} chart events")
+        return df
+
     def load_prescriptions(
         self,
         subject_ids: Optional[List[int]] = None,

@@ -381,17 +381,24 @@ class SyntheticDataGenerator:
         self,
         patient: PatientParameters,
         time_horizon_days: int = 365,
-        treatment_policy: Optional[Dict] = None
+        treatment_policy: Optional[Dict] = None,
+        include_vitals: bool = False,
+        include_med_history: bool = False,
     ) -> pd.DataFrame:
         """
         Simulate complete patient trajectory over time.
-        
+
         Args:
             patient: Patient parameters
             time_horizon_days: Length of simulation (days)
             treatment_policy: Treatment policy (medication doses, reminder schedule)
                             If None, uses default conservative policy
-            
+            include_vitals: If True, append 4 synthetic vital sign columns
+                (heart_rate, sbp, respiratory_rate, spo2) correlated with
+                glucose dynamics.
+            include_med_history: If True, append adherence_rate_7d (rolling
+                7-day mean of medication_taken) and medication_count (1.0).
+
         Returns:
             DataFrame with columns:
             - day: Day number
@@ -400,6 +407,8 @@ class SyntheticDataGenerator:
             - medication_taken: Adherence indicator
             - reminder_sent: Reminder indicator
             - meal_glucose: Glucose from meals
+            - [heart_rate, sbp, respiratory_rate, spo2] if include_vitals
+            - [adherence_rate_7d, medication_count] if include_med_history
         """
         logger.info(f"Simulating trajectory for patient {patient.patient_id}")
         
@@ -501,7 +510,47 @@ class SyntheticDataGenerator:
         # Add adverse events
         df['hypoglycemia'] = (df['glucose_min'] < 70).astype(int)
         df['hyperglycemia'] = (df['glucose_max'] > 180).astype(int)
-        
+
+        # --- Vital signs (opt-in) ---
+        # Physiologically plausible values correlated with glucose dynamics:
+        #   heart_rate: tachycardia (~+15 bpm) during hypoglycemia (sympathetic response)
+        #   sbp: mild positive correlation with glucose (diabetic hypertension)
+        #   respiratory_rate: Kussmaul breathing risk (+3) during hyperglycemia
+        #   spo2: slight drop during hyperglycemia; clipped to [93, 100]
+        if include_vitals:
+            df['heart_rate'] = (
+                75.0
+                + 15.0 * df['hypoglycemia']
+                + self.rng.normal(0, 5, len(df))
+            )
+            df['sbp'] = (
+                125.0
+                + 0.05 * (df['glucose_mean'] - 100.0)
+                + self.rng.normal(0, 5, len(df))
+            )
+            df['respiratory_rate'] = (
+                15.0
+                + 3.0 * df['hyperglycemia']
+                + self.rng.normal(0, 2, len(df))
+            )
+            df['spo2'] = np.clip(
+                98.5
+                - 0.5 * df['hyperglycemia']
+                + self.rng.normal(0, 0.5, len(df)),
+                93.0, 100.0,
+            )
+
+        # --- Medication history (opt-in) ---
+        if include_med_history:
+            # Rolling 7-day adherence rate (trailing window, min 1 observation)
+            df['adherence_rate_7d'] = (
+                df['medication_taken']
+                .rolling(window=7, min_periods=1)
+                .mean()
+            )
+            # Synthetic patients are on a single insulin therapy
+            df['medication_count'] = 1.0
+
         logger.info(f"Simulated {len(df)} days for patient {patient.patient_id}")
         return df
     

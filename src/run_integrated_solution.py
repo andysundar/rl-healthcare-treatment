@@ -82,6 +82,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# State-column constants — shared by all pipeline stages
+# ---------------------------------------------------------------------------
+BASE_STATE_COLS = [
+    'glucose_mean', 'glucose_std', 'glucose_min', 'glucose_max',
+    'insulin_mean', 'medication_taken', 'reminder_sent',
+    'hypoglycemia', 'hyperglycemia', 'day',
+]
+VITAL_COLS       = ['heart_rate', 'sbp', 'respiratory_rate', 'spo2']
+MED_HISTORY_COLS = ['adherence_rate_7d', 'medication_count']
+
 
 class IntegratedSolutionRunner:
     """Main class for running the integrated RL healthcare solution."""
@@ -107,6 +118,19 @@ class IntegratedSolutionRunner:
             return torch.device('cuda')
         else:
             return torch.device('cpu')
+
+    def _get_state_cols(self) -> list:
+        """Return ordered state column names based on active feature flags."""
+        cols = list(BASE_STATE_COLS)
+        if getattr(self.config, 'use_vitals', False):
+            cols.extend(VITAL_COLS)
+        if getattr(self.config, 'use_med_history', False):
+            cols.extend(MED_HISTORY_COLS)
+        return cols
+
+    def _get_state_dim(self) -> int:
+        """Return scalar state dimension based on active feature flags."""
+        return len(self._get_state_cols())
 
     def run_full_pipeline(self):
         """Run complete end-to-end pipeline."""
@@ -184,18 +208,24 @@ class IntegratedSolutionRunner:
             n_patients=self.config.n_synthetic_patients
         )
 
-        state_cols = [
-            'glucose_mean', 'glucose_std', 'glucose_min', 'glucose_max',
-            'insulin_mean', 'medication_taken', 'reminder_sent',
-            'hypoglycemia', 'hyperglycemia', 'day',
-        ]
+        # Derive state columns from active feature flags
+        state_cols = self._get_state_cols()
+        use_vitals      = getattr(self.config, 'use_vitals', False)
+        use_med_history = getattr(self.config, 'use_med_history', False)
+        if use_vitals or use_med_history:
+            logger.info(
+                f"Extended state: {len(state_cols)}-dim "
+                f"(vitals={use_vitals}, med_history={use_med_history})"
+            )
 
         trajectories = []
         for patient in patients:
             traj_df = generator.simulate_patient_trajectory(
                 patient=patient,
                 time_horizon_days=self.config.trajectory_length,
-                treatment_policy=None
+                treatment_policy=None,
+                include_vitals=use_vitals,
+                include_med_history=use_med_history,
             )
             for i in range(len(traj_df) - 1):
                 row = traj_df.iloc[i]
@@ -227,7 +257,8 @@ class IntegratedSolutionRunner:
             'val': val_data,
             'test': test_data,
             'patients': patients,
-            'source': 'synthetic'
+            'source': 'synthetic',
+            'state_cols': state_cols,
         }
 
         output_path = self.output_dir / 'synthetic_data.pkl'
@@ -278,6 +309,44 @@ class IntegratedSolutionRunner:
         labs = loader.load_lab_events(subject_ids=final_cohort)
         prescriptions = loader.load_prescriptions(subject_ids=final_cohort)
 
+        # --- Vital signs (opt-in via --use-vitals) ---
+        vitals_df = None
+        if getattr(self.config, 'use_vitals', False):
+            logger.info("Loading CHARTEVENTS for vital signs...")
+            # All item IDs used by FeatureEngineer.extract_vitals_sequence()
+            all_vital_ids = [
+                211, 220045,                         # heart_rate
+                51, 442, 455, 6701, 220050, 220179,  # sbp
+                618, 615, 220210, 224690,             # respiratory_rate
+                646, 220277,                          # spo2
+            ]
+            chartevents = loader.load_chartevents(
+                subject_ids=final_cohort,
+                item_ids=all_vital_ids,
+            )
+            if len(chartevents) > 0:
+                engineer_for_vitals = FeatureEngineer()
+                vitals_df = engineer_for_vitals.extract_vitals_sequence(
+                    chartevents, subject_ids=final_cohort
+                )
+                logger.info(
+                    f"Extracted vitals: {len(vitals_df):,} timepoints, "
+                    f"cols={[c for c in vitals_df.columns if c not in ('subject_id','hadm_id','charttime')]}"
+                )
+
+        # --- Medication history (opt-in via --use-med-history) ---
+        med_history_df = None
+        if getattr(self.config, 'use_med_history', False):
+            logger.info("Extracting medication history from prescriptions...")
+            engineer_for_meds = FeatureEngineer()
+            med_history_df = engineer_for_meds.extract_medication_history(
+                prescriptions, encoding='binary'
+            )
+            logger.info(
+                f"Medication history: {len(med_history_df.columns)-1} drug columns, "
+                f"{len(med_history_df):,} patients"
+            )
+
         engineer = FeatureEngineer()
         demographics = engineer.extract_demographics(patients, admissions)
         demographics = demographics[demographics['subject_id'].isin(final_cohort)]
@@ -302,7 +371,10 @@ class IntegratedSolutionRunner:
             'test': test,
             'demographics': demographics,
             'cohort': final_cohort,
-            'source': 'mimic'
+            'source': 'mimic',
+            'state_cols': self._get_state_cols(),
+            'vitals': vitals_df,
+            'med_history': med_history_df,
         }
 
         logger.info(f"Train: {len(train):,} | Val: {len(val):,} | Test: {len(test):,}")
@@ -377,8 +449,10 @@ class IntegratedSolutionRunner:
         from models.encoders import PatientAutoencoder, EncoderConfig
         from models.encoders.state_encoder_wrapper import StateEncoderWrapper
 
+        # StateEncoderWrapper always passes the full flat state as "labs";
+        # vital_dim / demo_dim stay 0 to avoid MPS device-mismatch on missing modalities.
         enc_cfg = EncoderConfig(
-            lab_dim=10,
+            lab_dim=self._get_state_dim(),
             vital_dim=0,
             demo_dim=0,
             state_dim=getattr(self.config, 'encoder_state_dim', 64),
@@ -386,7 +460,7 @@ class IntegratedSolutionRunner:
         variational = (getattr(self.config, 'encoder_type', 'autoencoder') == 'vae')
         ae = PatientAutoencoder(enc_cfg, variational=variational)
         device = self.get_device()
-        wrapper = StateEncoderWrapper(ae, device=device, raw_state_dim=10)
+        wrapper = StateEncoderWrapper(ae, device=device, raw_state_dim=self._get_state_dim())
 
         checkpoint = getattr(self.config, 'encoder_checkpoint', None)
         if checkpoint:
@@ -446,7 +520,8 @@ class IntegratedSolutionRunner:
             test_data = data['test']
             train_data = data['train']
 
-        state_dim = 10
+        # Derive state_dim from actual data to stay correct with --use-vitals / --use-med-history
+        state_dim = len(train_data[0][0]) if train_data else self._get_state_dim()
         action_dim = 1
 
         train_states = np.array([d[0] for d in train_data])
@@ -546,7 +621,7 @@ class IntegratedSolutionRunner:
 
         logger.info("Configuring CQL...")
         config = CQLConfig(
-            state_dim=10,
+            state_dim=self._get_state_dim(),
             action_dim=1,
             hidden_dim=256,
             q_lr=3e-4,
@@ -576,11 +651,11 @@ class IntegratedSolutionRunner:
         elif data['source'] == 'synthetic':
             train_data = data['train']
             val_data   = data['val']
-            state_dim  = 10
+            state_dim  = self._get_state_dim()
         else:
             train_data = self._convert_to_trajectory_format(data['train'])
             val_data   = self._convert_to_trajectory_format(data['val'])
-            state_dim  = 10
+            state_dim  = self._get_state_dim()
 
         # Rebuild agent with correct state_dim
         agent = CQLAgent(
@@ -1164,7 +1239,12 @@ class IntegratedSolutionRunner:
             # ----------------------------------------------------------
             if self.results.get('cql', {}).get('trained', False):
                 history = self.results['cql'].get('history', {})
-                train_losses = history.get('train_losses', [])
+                train_losses_raw = history.get('train_losses', [])
+                # CQL stores losses as dicts; extract total_loss or q_loss scalar
+                train_losses = [
+                    (v.get('total_loss', v.get('q_loss', 0.0)) if isinstance(v, dict) else float(v))
+                    for v in train_losses_raw
+                ]
                 eval_returns = history.get('eval_returns', [])
 
                 n_panels = (1 if not train_losses else 1) + (1 if not eval_returns else 1)
@@ -1309,17 +1389,13 @@ class IntegratedSolutionRunner:
         vector uses these 10 columns in order.  The evaluators look for keys
         'glucose' and 'bp_systolic', so we add aliases.
         """
-        STATE_COLS = [
-            'glucose_mean', 'glucose_std', 'glucose_min', 'glucose_max',
-            'insulin_mean', 'medication_taken', 'reminder_sent',
-            'hypoglycemia', 'hyperglycemia', 'day',
-        ]
+        STATE_COLS = self.results.get('data', {}).get('state_cols', BASE_STATE_COLS)
 
         def _vec_to_dict(vec):
             d = {k: float(v) for k, v in zip(STATE_COLS, vec)}
             d['glucose']                  = d['glucose_mean']
-            d['bp_systolic']              = 120.0   # not in synthetic; safe constant
-            d['blood_pressure_systolic']  = 120.0
+            d['bp_systolic']              = d.get('sbp', 120.0)  # real if --use-vitals; fallback constant
+            d['blood_pressure_systolic']  = d['bp_systolic']
             d['adherence_score']          = d['medication_taken']
             return d
 
@@ -1406,6 +1482,12 @@ def parse_arguments():
                         help='Max depth for surrogate decision tree')
     parser.add_argument('--explain-n-samples', type=int, default=50,
                         help='Number of test states to explain')
+
+    # Extended state flags
+    parser.add_argument('--use-vitals', action='store_true',
+                        help='Extend state with heart_rate, sbp, respiratory_rate, spo2 (+4 dims)')
+    parser.add_argument('--use-med-history', action='store_true',
+                        help='Extend state with adherence_rate_7d, medication_count (+2 dims)')
 
     return parser.parse_args()
 
