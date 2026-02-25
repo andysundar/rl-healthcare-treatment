@@ -270,32 +270,26 @@ class IntegratedSolutionRunner:
         return data
 
     def prepare_mimic_data(self):
-        """Prepare data from MIMIC-III."""
+        """Prepare MIMIC-III data as RL trajectory tuples (same format as synthetic)."""
         logger.info("Loading MIMIC-III data...")
 
-        from data import (
-            MIMICLoader, CohortBuilder, FeatureEngineer,
-            DataPreprocessor, split_train_val_test
-        )
+        from data import MIMICLoader, CohortBuilder, FeatureEngineer, DataPreprocessor
 
         loader = MIMICLoader(data_dir=self.config.mimic_dir, use_cache=True)
 
-        patients = loader.load_patients()
-        admissions = loader.load_admissions()
-        diagnoses = loader.load_diagnoses_icd()
-
+        patients    = loader.load_patients()
+        admissions  = loader.load_admissions()
+        diagnoses   = loader.load_diagnoses_icd()
         logger.info(f"Loaded {len(patients):,} patients")
 
-        builder = CohortBuilder(patients, admissions, diagnoses)
-        diabetes_patients = builder.define_diabetes_cohort()
-
-        filtered_patients = builder.apply_inclusion_criteria(
-            diabetes_patients, min_age=18, max_age=80, min_admissions=2
+        builder          = CohortBuilder(patients, admissions, diagnoses)
+        diabetes_pts     = builder.define_diabetes_cohort()
+        filtered_pts     = builder.apply_inclusion_criteria(
+            diabetes_pts, min_age=18, max_age=80, min_admissions=2
         )
-        final_cohort = builder.apply_exclusion_criteria(
-            filtered_patients, exclude_pregnancy=True, exclude_pediatric=True
+        final_cohort     = builder.apply_exclusion_criteria(
+            filtered_pts, exclude_pregnancy=True, exclude_pediatric=True
         )
-
         logger.info(f"Final cohort: {len(final_cohort):,} patients")
 
         if self.config.use_sample:
@@ -306,14 +300,13 @@ class IntegratedSolutionRunner:
             )
             logger.info(f"Using sample of {len(final_cohort)} patients")
 
-        labs = loader.load_lab_events(subject_ids=final_cohort)
+        labs          = loader.load_lab_events(subject_ids=final_cohort)
         prescriptions = loader.load_prescriptions(subject_ids=final_cohort)
 
         # --- Vital signs (opt-in via --use-vitals) ---
         vitals_df = None
         if getattr(self.config, 'use_vitals', False):
             logger.info("Loading CHARTEVENTS for vital signs...")
-            # All item IDs used by FeatureEngineer.extract_vitals_sequence()
             all_vital_ids = [
                 211, 220045,                         # heart_rate
                 51, 442, 455, 6701, 220050, 220179,  # sbp
@@ -321,63 +314,172 @@ class IntegratedSolutionRunner:
                 646, 220277,                          # spo2
             ]
             chartevents = loader.load_chartevents(
-                subject_ids=final_cohort,
-                item_ids=all_vital_ids,
+                subject_ids=final_cohort, item_ids=all_vital_ids,
             )
             if len(chartevents) > 0:
-                engineer_for_vitals = FeatureEngineer()
-                vitals_df = engineer_for_vitals.extract_vitals_sequence(
+                vitals_df = FeatureEngineer().extract_vitals_sequence(
                     chartevents, subject_ids=final_cohort
                 )
-                logger.info(
-                    f"Extracted vitals: {len(vitals_df):,} timepoints, "
-                    f"cols={[c for c in vitals_df.columns if c not in ('subject_id','hadm_id','charttime')]}"
-                )
+                logger.info(f"Extracted vitals: {len(vitals_df):,} timepoints")
 
-        # --- Medication history (opt-in via --use-med-history) ---
-        med_history_df = None
-        if getattr(self.config, 'use_med_history', False):
-            logger.info("Extracting medication history from prescriptions...")
-            engineer_for_meds = FeatureEngineer()
-            med_history_df = engineer_for_meds.extract_medication_history(
-                prescriptions, encoding='binary'
-            )
-            logger.info(
-                f"Medication history: {len(med_history_df.columns)-1} drug columns, "
-                f"{len(med_history_df):,} patients"
-            )
-
-        engineer = FeatureEngineer()
+        engineer     = FeatureEngineer()
         demographics = engineer.extract_demographics(patients, admissions)
         demographics = demographics[demographics['subject_id'].isin(final_cohort)]
 
+        if len(labs) == 0:
+            raise ValueError(
+                "No lab events found for cohort. "
+                "Verify --mimic-dir points to the MIMIC-III CSV directory."
+            )
+
         lab_sequence = engineer.extract_lab_sequence(labs, final_cohort)
+        if len(lab_sequence) == 0:
+            raise ValueError("Lab sequence extraction produced no rows.")
+
+        # Deduplicate before computing per-row indices
+        lab_sequence = (
+            lab_sequence
+            .drop_duplicates(subset=['subject_id', 'hadm_id', 'charttime'])
+            .sort_values(['subject_id', 'hadm_id', 'charttime'])
+            .reset_index(drop=True)
+        )
+
+        # --- Clinical flags from RAW glucose (before any normalization) ---
+        clin_flags = lab_sequence[['subject_id', 'hadm_id', 'charttime']].copy()
+        if 'glucose' in lab_sequence.columns:
+            clin_flags['hypoglycemia']  = (lab_sequence['glucose'] < 70.0).astype(float)
+            clin_flags['hyperglycemia'] = (lab_sequence['glucose'] > 180.0).astype(float)
+        else:
+            clin_flags['hypoglycemia']  = 0.0
+            clin_flags['hyperglycemia'] = 0.0
+
+        # --- Day index per admission (0-indexed step within each hadm_id) ---
+        day_idx = lab_sequence[['subject_id', 'hadm_id', 'charttime']].copy()
+        day_idx['day_raw'] = (
+            lab_sequence.groupby(['subject_id', 'hadm_id']).cumcount().astype(float)
+        )
+
+        # --- Insulin features from prescriptions ---
+        insulin_daily = self._extract_insulin_daily(prescriptions, set(final_cohort))
+
+        # --- Standard preprocessing pipeline (only on lab values) ---
         temporal_features = engineer.create_temporal_features(
             lab_sequence, time_column='charttime'
         )
-
-        preprocessor = DataPreprocessor()
-        clean_data = preprocessor.clean_missing_values(temporal_features)
-        clean_data = preprocessor.handle_outliers(clean_data)
+        preprocessor   = DataPreprocessor()
+        clean_data     = preprocessor.clean_missing_values(temporal_features)
+        clean_data     = preprocessor.handle_outliers(clean_data)
         normalized_data = preprocessor.normalize_labs(clean_data)
 
-        train, val, test = split_train_val_test(
-            normalized_data, ratios=(0.7, 0.15, 0.15), random_state=42
+        # --- Join supplementary features (outside normalizer to protect binary cols) ---
+        # Clinical flags
+        normalized_data = normalized_data.merge(
+            clin_flags, on=['subject_id', 'hadm_id', 'charttime'], how='left'
+        )
+        # Day index → normalize to [0, 1] within each admission
+        normalized_data = normalized_data.merge(
+            day_idx, on=['subject_id', 'hadm_id', 'charttime'], how='left'
+        )
+        max_days = (
+            normalized_data.groupby(['subject_id', 'hadm_id'])['day_raw']
+            .transform('max').replace(0, 1)
+        )
+        normalized_data['day'] = (normalized_data['day_raw'] / max_days).fillna(0.0)
+
+        # Insulin (join by subject_id + date)
+        normalized_data['_jdate'] = pd.to_datetime(
+            normalized_data['charttime'], errors='coerce'
+        ).dt.date
+        if len(insulin_daily) > 0:
+            normalized_data = normalized_data.merge(
+                insulin_daily.rename(columns={'_lab_date': '_jdate'}),
+                on=['subject_id', '_jdate'], how='left',
+            )
+        for col in ['insulin_flag', 'insulin_dose']:
+            if col not in normalized_data.columns:
+                normalized_data[col] = 0.0
+            else:
+                normalized_data[col] = normalized_data[col].fillna(0.0)
+        normalized_data = normalized_data.drop(columns=['_jdate'], errors='ignore')
+
+        # Vitals (daily aggregate → join by subject_id + hadm_id + date)
+        if getattr(self.config, 'use_vitals', False) and vitals_df is not None and len(vitals_df) > 0:
+            avail_vcols = [c for c in VITAL_COLS if c in vitals_df.columns]
+            if avail_vcols:
+                vdf        = vitals_df.copy()
+                vdf['_vd'] = pd.to_datetime(vdf['charttime'], errors='coerce').dt.date
+                vagg       = (
+                    vdf.groupby(['subject_id', 'hadm_id', '_vd'])[avail_vcols]
+                    .mean().reset_index().rename(columns={'_vd': '_jdate'})
+                )
+                normalized_data['_jdate'] = pd.to_datetime(
+                    normalized_data['charttime'], errors='coerce'
+                ).dt.date
+                normalized_data = normalized_data.merge(
+                    vagg, on=['subject_id', 'hadm_id', '_jdate'], how='left'
+                )
+                normalized_data = normalized_data.drop(columns=['_jdate'], errors='ignore')
+        for col in VITAL_COLS:
+            if col not in normalized_data.columns:
+                normalized_data[col] = 0.0
+            else:
+                normalized_data[col] = normalized_data[col].fillna(0.0)
+
+        # Medication history
+        if getattr(self.config, 'use_med_history', False):
+            med_hist = self._compute_med_history_features(prescriptions, set(final_cohort))
+            normalized_data = normalized_data.merge(med_hist, on='subject_id', how='left')
+        for col in MED_HISTORY_COLS:
+            if col not in normalized_data.columns:
+                normalized_data[col] = 0.0
+            else:
+                normalized_data[col] = normalized_data[col].fillna(0.0)
+
+        # Clean up utility columns
+        normalized_data = normalized_data.drop(columns=['day_raw'], errors='ignore')
+
+        # --- Map MIMIC columns → BASE_STATE_COLS naming ---
+        normalized_data = self._build_mimic_state_columns(normalized_data)
+
+        state_cols = self._get_state_cols()
+        for col in state_cols:
+            if col not in normalized_data.columns:
+                logger.warning("State column '%s' missing from MIMIC data, filling 0.", col)
+                normalized_data[col] = 0.0
+
+        # --- Patient-level train / val / test split ---
+        unique_pts = list(set(final_cohort))
+        rng        = np.random.default_rng(42)
+        rng.shuffle(unique_pts)
+        n_train = int(0.70 * len(unique_pts))
+        n_val   = int(0.15 * len(unique_pts))
+        train_pts = set(unique_pts[:n_train])
+        val_pts   = set(unique_pts[n_train:n_train + n_val])
+        test_pts  = set(unique_pts[n_train + n_val:])
+
+        train_data = self._build_mimic_trajectories(
+            normalized_data[normalized_data['subject_id'].isin(train_pts)], state_cols
+        )
+        val_data = self._build_mimic_trajectories(
+            normalized_data[normalized_data['subject_id'].isin(val_pts)], state_cols
+        )
+        test_data = self._build_mimic_trajectories(
+            normalized_data[normalized_data['subject_id'].isin(test_pts)], state_cols
         )
 
         data = {
-            'train': train,
-            'val': val,
-            'test': test,
+            'train':        train_data,
+            'val':          val_data,
+            'test':         test_data,
             'demographics': demographics,
-            'cohort': final_cohort,
-            'source': 'mimic',
-            'state_cols': self._get_state_cols(),
-            'vitals': vitals_df,
-            'med_history': med_history_df,
+            'cohort':       final_cohort,
+            'source':       'mimic',
+            'state_cols':   state_cols,
         }
-
-        logger.info(f"Train: {len(train):,} | Val: {len(val):,} | Test: {len(test):,}")
+        logger.info(
+            f"MIMIC trajectories — Train: {len(train_data):,} | "
+            f"Val: {len(val_data):,} | Test: {len(test_data):,}"
+        )
         return data
 
     # ------------------------------------------------------------------
@@ -1417,8 +1519,162 @@ class IntegratedSolutionRunner:
             trajectories.append(current)
         return trajectories
 
-    def _convert_to_trajectory_format(self, df):
-        logger.warning("Trajectory conversion not implemented - using placeholder")
+    # ------------------------------------------------------------------
+    # MIMIC-III trajectory helpers
+    # ------------------------------------------------------------------
+
+    def _extract_insulin_daily(
+        self, prescriptions: pd.DataFrame, subject_ids: set
+    ) -> pd.DataFrame:
+        """Return a DataFrame of daily insulin usage: subject_id, _lab_date, insulin_flag, insulin_dose."""
+        empty = pd.DataFrame(columns=['subject_id', '_lab_date', 'insulin_flag', 'insulin_dose'])
+        if len(prescriptions) == 0:
+            return empty
+
+        mask    = prescriptions['drug'].str.contains('insulin', case=False, na=False)
+        insulin = prescriptions[mask & prescriptions['subject_id'].isin(subject_ids)].copy()
+        if len(insulin) == 0:
+            return empty
+
+        date_col = 'startdate' if 'startdate' in insulin.columns else None
+        if date_col is None:
+            return empty
+
+        insulin['_lab_date'] = pd.to_datetime(insulin[date_col], errors='coerce').dt.date
+        insulin = insulin.dropna(subset=['_lab_date'])
+        if len(insulin) == 0:
+            return empty
+
+        daily = (
+            insulin.groupby(['subject_id', '_lab_date'])
+            .size().reset_index(name='_cnt')
+        )
+        daily['insulin_flag'] = 1.0
+        daily['insulin_dose'] = 1.0  # binary (actual dosing info not reliably available)
+        return daily[['subject_id', '_lab_date', 'insulin_flag', 'insulin_dose']]
+
+    def _compute_med_history_features(
+        self, prescriptions: pd.DataFrame, subject_ids: set
+    ) -> pd.DataFrame:
+        """Return per-patient adherence_rate_7d and medication_count."""
+        result = pd.DataFrame({'subject_id': list(subject_ids)})
+        if len(prescriptions) == 0:
+            result['adherence_rate_7d'] = 0.5
+            result['medication_count']  = 0.0
+            return result
+
+        presc = prescriptions[prescriptions['subject_id'].isin(subject_ids)]
+        counts = (
+            presc.groupby('subject_id')['drug']
+            .nunique().reset_index(name='medication_count')
+        )
+        max_cnt = counts['medication_count'].max()
+        if max_cnt > 0:
+            counts['medication_count'] = counts['medication_count'] / max_cnt
+
+        result = result.merge(counts, on='subject_id', how='left')
+        result['medication_count']  = result['medication_count'].fillna(0.0)
+        result['adherence_rate_7d'] = 0.5  # no direct adherence data in MIMIC
+        return result[['subject_id', 'adherence_rate_7d', 'medication_count']]
+
+    def _build_mimic_state_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add BASE_STATE_COLS columns from MIMIC-derived features (in-place copy)."""
+        r = df.copy()
+
+        # glucose_mean ← rolling_mean_glucose (from create_temporal_features) or glucose
+        for src in ['rolling_mean_glucose', 'glucose']:
+            if src in df.columns:
+                r['glucose_mean'] = df[src].fillna(0.0)
+                break
+        else:
+            r['glucose_mean'] = 0.0
+
+        # glucose_std ← rolling_std_glucose
+        r['glucose_std'] = (
+            df['rolling_std_glucose'].fillna(0.0)
+            if 'rolling_std_glucose' in df.columns else 0.0
+        )
+
+        # glucose_min / glucose_max ← approximate from mean ± std
+        r['glucose_min'] = r['glucose_mean'] - r['glucose_std']
+        r['glucose_max'] = r['glucose_mean'] + r['glucose_std']
+
+        # insulin_mean ← insulin_dose (binary proxy)
+        r['insulin_mean'] = (
+            df['insulin_dose'].fillna(0.0) if 'insulin_dose' in df.columns else 0.0
+        )
+
+        # medication_taken ← insulin_flag
+        r['medication_taken'] = (
+            df['insulin_flag'].fillna(0.0) if 'insulin_flag' in df.columns else 0.0
+        )
+
+        # reminder_sent ← 0 (not in MIMIC)
+        r['reminder_sent'] = 0.0
+
+        # hypoglycemia / hyperglycemia ← computed from raw glucose before normalization
+        for col in ['hypoglycemia', 'hyperglycemia']:
+            if col not in r.columns:
+                r[col] = 0.0
+            else:
+                r[col] = r[col].fillna(0.0)
+
+        # day ← should already be normalized [0,1]; ensure it exists
+        if 'day' not in r.columns:
+            r['day'] = 0.0
+        else:
+            r['day'] = r['day'].fillna(0.0)
+
+        return r
+
+    def _build_mimic_trajectories(
+        self, df: pd.DataFrame, state_cols: list
+    ) -> list:
+        """Build (state, action, reward, next_state, done) tuples from MIMIC data."""
+        if df.empty:
+            return []
+
+        # Pre-ensure all state columns exist
+        for col in state_cols:
+            if col not in df.columns:
+                df = df.copy()
+                df[col] = 0.0
+
+        df = df.sort_values(['subject_id', 'hadm_id', 'charttime']).reset_index(drop=True)
+        trajectories = []
+
+        for (_, _), adm_df in df.groupby(['subject_id', 'hadm_id']):
+            adm_df  = adm_df.reset_index(drop=True)
+            n_steps = len(adm_df)
+            if n_steps < 2:
+                continue
+
+            states      = adm_df[state_cols].fillna(0.0).values.astype(np.float32)
+            med_col     = 'medication_taken'
+            actions_raw = (
+                adm_df[med_col].fillna(0.0).values
+                if med_col in adm_df.columns else np.zeros(n_steps)
+            )
+            hypo_raw  = adm_df['hypoglycemia'].fillna(0.0).values  if 'hypoglycemia'  in adm_df.columns else np.zeros(n_steps)
+            hyper_raw = adm_df['hyperglycemia'].fillna(0.0).values if 'hyperglycemia' in adm_df.columns else np.zeros(n_steps)
+
+            for i in range(n_steps - 1):
+                action  = np.array([float(actions_raw[i])], dtype=np.float32)
+                reward  = float(1.0 - 2.0 * hypo_raw[i] - 1.0 * hyper_raw[i])
+                done    = (i == n_steps - 2)
+                trajectories.append((
+                    states[i], action, reward, states[i + 1], done
+                ))
+
+        return trajectories
+
+    def _convert_to_trajectory_format(self, data):
+        """Return trajectory tuples unchanged; MIMIC now produces tuples directly."""
+        if isinstance(data, list):
+            return data
+        logger.warning(
+            "_convert_to_trajectory_format: unexpected type %s — returning []", type(data)
+        )
         return []
 
 
