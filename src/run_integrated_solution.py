@@ -47,9 +47,9 @@ from evaluation import (
     EvaluationConfig,
 )
 
-from data import SyntheticDataGenerator
+from data import SyntheticDataGenerator, TrajectoryBuildConfig, DeterministicTrajectoryBuilder
 
-from models.rl import CQLConfig, CQLAgent
+from models.rl import CQLConfig, CQLAgent, IQLAgent
 
 from models.baselines import (
     create_diabetes_rule_policy,
@@ -153,6 +153,8 @@ class IntegratedSolutionRunner:
         if self.config.mode in ['full', 'train-eval']:
             self.stage_4_cql_training()
 
+        self.stage_4b_iql_training()
+
         if self.config.mode in ['full', 'train-eval', 'eval-only']:
             self.stage_5_evaluation()
 
@@ -161,6 +163,7 @@ class IntegratedSolutionRunner:
 
         # Interpretability (opt-in)
         self.stage_7_interpretability()
+        self.stage_7b_policy_distillation()
 
         self.stage_6_generate_reports()
 
@@ -218,7 +221,7 @@ class IntegratedSolutionRunner:
                 f"(vitals={use_vitals}, med_history={use_med_history})"
             )
 
-        trajectories = []
+        rows = []
         for patient in patients:
             traj_df = generator.simulate_patient_trajectory(
                 patient=patient,
@@ -227,30 +230,34 @@ class IntegratedSolutionRunner:
                 include_vitals=use_vitals,
                 include_med_history=use_med_history,
             )
-            for i in range(len(traj_df) - 1):
-                row = traj_df.iloc[i]
-                next_row = traj_df.iloc[i + 1]
-                state = row[state_cols].values.astype(np.float32)
-                next_state = next_row[state_cols].values.astype(np.float32)
-                action = np.array([float(row['medication_taken'])], dtype=np.float32)
-                reward = 0.0
-                if 80 <= row['glucose_mean'] <= 180:
-                    reward += 1.0
-                reward -= 2.0 * float(row['hypoglycemia'])
-                reward -= 1.0 * float(row['hyperglycemia'])
-                reward += 0.5 * float(row['medication_taken'])
-                done = (i == len(traj_df) - 2)
-                trajectories.append((state, action, float(reward), next_state, done))
+            traj_df['subject_id'] = patient.patient_id
+            traj_df['hadm_id'] = patient.patient_id
+            traj_df['action'] = traj_df['medication_taken'].astype(float)
+            traj_df['reward'] = (
+                (traj_df['glucose_mean'].between(80, 180)).astype(float)
+                - 2.0 * traj_df['hypoglycemia'].astype(float)
+                - 1.0 * traj_df['hyperglycemia'].astype(float)
+                + 0.5 * traj_df['medication_taken'].astype(float)
+            )
+            rows.append(traj_df)
+
+        all_df = pd.concat(rows, ignore_index=True)
+        tb_cfg = TrajectoryBuildConfig(
+            patient_keys=('subject_id', 'hadm_id'),
+            time_col='day',
+            state_cols=state_cols,
+            action_col='action',
+            reward_col='reward',
+            seed=42,
+        )
+        builder = DeterministicTrajectoryBuilder(tb_cfg)
+        train_df, val_df, test_df = builder.patient_split(all_df, ratios=(0.7, 0.15, 0.15))
+        train_data = builder.build(train_df)
+        val_data = builder.build(val_df)
+        test_data = builder.build(test_df)
 
         logger.info(f"Generated {len(patients)} synthetic patients")
-        logger.info(f"Generated {len(trajectories)} transitions")
-
-        n_train = int(0.7 * len(trajectories))
-        n_val = int(0.15 * len(trajectories))
-
-        train_data = trajectories[:n_train]
-        val_data = trajectories[n_train:n_train + n_val]
-        test_data = trajectories[n_train + n_val:]
+        logger.info(f"Generated transitions Train/Val/Test: {len(train_data)}/{len(val_data)}/{len(test_data)}")
 
         data = {
             'train': train_data,
@@ -822,6 +829,43 @@ class IntegratedSolutionRunner:
         }
         logger.info("CQL training complete")
 
+    def stage_4b_iql_training(self):
+        """Optional discrete-action IQL training (enabled in --demo)."""
+        if not getattr(self.config, 'train_iql', False):
+            return
+        if 'data' not in self.results:
+            logger.warning("No data available, skipping IQL training")
+            return
+        data = self.results['data']
+        train_data = data['train']
+        state_dim = len(train_data[0][0])
+        n_actions = int(getattr(self.config, 'discrete_actions', 2))
+        from models.rl.iql import IQLConfig
+        cfg = IQLConfig(state_dim=state_dim, n_actions=n_actions, device=str(self.get_device()))
+        agent = IQLAgent(cfg)
+
+        from models.safety.config import SafetyConfig as SafetyLayerConfig
+        from models.safety.safety_layer import SafetyLayer
+        safety = SafetyLayer(SafetyLayerConfig())
+
+        rng = np.random.default_rng(42)
+        for _ in range(getattr(self.config, 'iql_updates', 200)):
+            idx = rng.integers(0, len(train_data), size=min(64, len(train_data)))
+            b = [train_data[i] for i in idx]
+            states = torch.tensor(np.stack([x[0] for x in b]), dtype=torch.float32)
+            actions = np.array([int(np.clip(round(float(x[1][0])), 0, n_actions - 1)) for x in b], dtype=np.int64)
+            safe_actions = np.array([safety.apply_discrete_action_mask(s, a, n_actions) for s, a in zip(states.numpy(), actions)], dtype=np.int64)
+            batch = {
+                'states': states,
+                'actions': torch.tensor(safe_actions[:, None], dtype=torch.float32),
+                'rewards': torch.tensor(np.array([x[2] for x in b], dtype=np.float32)[:, None]),
+                'next_states': torch.tensor(np.stack([x[3] for x in b]), dtype=torch.float32),
+                'dones': torch.tensor(np.array([x[4] for x in b], dtype=np.float32)[:, None]),
+            }
+            agent.update(batch)
+        self.results['iql'] = {'agent': agent, 'trained': True, 'state_dim': state_dim, 'n_actions': n_actions}
+        logger.info("IQL training complete")
+
     # ------------------------------------------------------------------
     # Stage 5
     # ------------------------------------------------------------------
@@ -844,16 +888,24 @@ class IntegratedSolutionRunner:
         ope_evaluator = OffPolicyEvaluator()
         behavior_policy = baselines.get('Behavior-Cloning', next(iter(baselines.values())))
         ope_results = {}
+        ope_trajectories = self._to_ope_trajectories(test_data)
         for name, policy in baselines.items():
             logger.info(f"  Evaluating {name}...")
             try:
                 results = ope_evaluator.evaluate(
                     policy=policy,
                     behavior_policy=behavior_policy,
-                    trajectories=test_data,
-                    methods=['wis'],
+                    trajectories=ope_trajectories,
+                    methods=['wis', 'dr'],
                 )
-                ope_results[name] = results
+                ope_results[name] = {
+                    m: {
+                        'value_estimate': float(v.value_estimate),
+                        'std_error': float(v.std_error),
+                        'confidence_interval': [float(v.confidence_interval[0]), float(v.confidence_interval[1])],
+                        'metadata': v.metadata,
+                    } for m, v in results.items()
+                }
             except Exception as e:
                 logger.warning(f"    OPE failed for {name}: {e}")
                 ope_results[name] = None
@@ -896,6 +948,22 @@ class IntegratedSolutionRunner:
                 logger.warning(f"    Clinical metrics failed for {name}: {e}")
                 clinical_results[name] = None
 
+        if 'iql' in self.results:
+            from models.safety.config import SafetyConfig as SafetyLayerConfig
+            from models.safety.safety_layer import SafetyLayer
+            iql = self.results['iql']['agent']
+            n_actions = self.results['iql']['n_actions']
+            safety_layer = SafetyLayer(SafetyLayerConfig())
+            violations = 0
+            for s, _, _, _, _ in test_data:
+                a = int(iql.select_action(s, deterministic=True)[0])
+                if safety_layer.apply_discrete_action_mask(s, a, n_actions) != a:
+                    violations += 1
+            safety_results['IQL'] = {
+                'unsafe_action_rate': violations / max(1, len(test_data)),
+                'constraint_satisfaction_rate': 1.0 - (violations / max(1, len(test_data))),
+            }
+
         self.results['evaluation'] = {
             'ope': ope_results,
             'safety': safety_results,
@@ -916,6 +984,31 @@ class IntegratedSolutionRunner:
                 logger.info(f"  Guideline Compliance: {c['guideline_compliance']:.2%}")
 
         logger.info("\nEvaluation complete")
+
+    def stage_7b_policy_distillation(self):
+        """Distill learned policy to shallow decision tree and save rules/fidelity."""
+        if not getattr(self.config, 'run_distillation', True):
+            return
+        if 'iql' not in self.results or 'data' not in self.results:
+            return
+        from sklearn.tree import DecisionTreeClassifier, export_text
+        data = self.results['data']
+        agent = self.results['iql']['agent']
+        states = np.array([t[0] for t in data['test']], dtype=np.float32)
+        if len(states) == 0:
+            return
+        y = np.array([int(agent.select_action(s, deterministic=True)[0]) for s in states], dtype=int)
+        tree = DecisionTreeClassifier(max_depth=3, random_state=42)
+        tree.fit(states, y)
+        pred = tree.predict(states)
+        fidelity = float(np.mean(pred == y))
+        out_dir = self.output_dir / 'interpretability'
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rules = export_text(tree)
+        (out_dir / 'policy_rules.txt').write_text(rules)
+        (out_dir / 'distillation_metrics.json').write_text(json.dumps({'fidelity': fidelity}, indent=2))
+        self.results['policy_distillation'] = {'fidelity': fidelity, 'rules_path': str(out_dir / 'policy_rules.txt')}
+        logger.info(f"Policy distillation complete. fidelity={fidelity:.4f}")
 
     # ------------------------------------------------------------------
     # Stage 6
@@ -942,13 +1035,14 @@ class IntegratedSolutionRunner:
         if 'evaluation' in self.results:
             summary['evaluation'] = {
                 'safety_metrics': {
-                    name: res['safety_index'] if res else None
+                    name: (res.get('safety_index') if isinstance(res, dict) and 'safety_index' in res else res)
                     for name, res in self.results['evaluation']['safety'].items()
                 },
                 'clinical_metrics': {
                     name: res['guideline_compliance'] if res else None
                     for name, res in self.results['evaluation']['clinical'].items()
                 },
+                'ope_results': self.results['evaluation'].get('ope', {}),
             }
 
         if 'cql' in self.results:
@@ -1178,6 +1272,21 @@ class IntegratedSolutionRunner:
         if current['states']:
             episodes.append(current)
         return episodes
+
+    def _to_ope_trajectories(self, transitions):
+        """Convert flat transitions into OffPolicyEvaluator Trajectory objects."""
+        from evaluation.off_policy_eval import Trajectory
+        episodes = self._transitions_to_episodes(transitions)
+        out = []
+        for ep in episodes:
+            out.append(Trajectory(
+                states=np.asarray(ep['states'], dtype=np.float32),
+                actions=np.asarray(ep['actions'], dtype=np.float32).reshape(-1, 1),
+                rewards=np.asarray(ep['rewards'], dtype=np.float32),
+                next_states=np.asarray(ep['next_states'], dtype=np.float32),
+                dones=np.zeros(len(ep['rewards']), dtype=np.float32),
+            ))
+        return out
 
     def _to_state_trajectories(self, transitions, chunk_size: int = 30):
         """
@@ -1701,6 +1810,11 @@ def parse_arguments():
     parser.add_argument('--use-sample', action='store_true')
     parser.add_argument('--sample-size', type=int, default=100)
     parser.add_argument('--train-cql', action='store_true')
+    parser.add_argument('--train-iql', action='store_true', help='Train discrete IQL offline RL baseline')
+    parser.add_argument('--discrete-actions', type=int, default=2, help='Number of discrete action buckets for IQL')
+    parser.add_argument('--iql-updates', type=int, default=400, help='Number of IQL updates')
+    parser.add_argument('--demo', action='store_true', help='Run deterministic quick CPU demo')
+    parser.add_argument('--run-distillation', action='store_true', default=True, help='Run policy distillation step')
 
     # Encoder flags
     parser.add_argument('--use-encoder', action='store_true',
@@ -1750,6 +1864,14 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+    if args.demo:
+        args.mode = 'synthetic'
+        args.use_synthetic = True
+        args.n_synthetic_patients = min(args.n_synthetic_patients, 120)
+        args.trajectory_length = min(args.trajectory_length, 14)
+        args.train_iql = True
+        args.train_cql = False
+        args.output_dir = args.output_dir or 'outputs/demo'
     runner = IntegratedSolutionRunner(args)
 
     try:

@@ -10,13 +10,13 @@ import numpy as np
 import sys
 from pathlib import Path
 
-# Add current directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
+# Add repo root to path for package imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from encoder_config import EncoderConfig
-from transformer_encoder import TransformerPatientEncoder
-from autoencoder import PatientAutoencoder, DeepAutoencoder
-from train_encoder import PatientDataset, create_dummy_dataset
+from src.models.encoders.encoder_config import EncoderConfig
+from src.models.encoders.transformer_encoder import TransformerPatientEncoder
+from src.models.encoders.autoencoder import PatientAutoencoder, DeepAutoencoder
+from src.models.encoders.train_encoder import PatientDataset, create_dummy_dataset
 
 
 def test_config():

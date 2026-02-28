@@ -36,6 +36,10 @@ from .data_validator import (
     DataQualityValidator,
     ValidationResult
 )
+from .trajectory_builder import (
+    TrajectoryBuildConfig,
+    DeterministicTrajectoryBuilder
+)
 from .utils import (
     load_icd9_mappings,
     lookup_icd9_description,
@@ -78,6 +82,10 @@ __all__ = [
     # Validation
     'DataQualityValidator',
     'ValidationResult',
+
+    # Trajectory builder
+    'TrajectoryBuildConfig',
+    'DeterministicTrajectoryBuilder',
     
     # Utilities
     'load_icd9_mappings',

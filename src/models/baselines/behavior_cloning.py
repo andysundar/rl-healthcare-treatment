@@ -500,6 +500,15 @@ class BehaviorCloningPolicy(BaselinePolicy):
         
         return action
     
+
+    def get_action_probability(self, state: np.ndarray, action: np.ndarray, sigma: float = 0.1) -> float:
+        """Approximate action probability using Gaussian around predicted mean action."""
+        pred = np.asarray(self.select_action(state, deterministic=True), dtype=np.float32).reshape(-1)
+        act = np.asarray(action, dtype=np.float32).reshape(-1)
+        var = sigma ** 2
+        logp = -0.5 * np.sum(((act - pred) ** 2) / var + np.log(2 * np.pi * var))
+        return float(np.exp(np.clip(logp, -30, 5)))
+
     def evaluate(self, test_data: List[Tuple]) -> BaselineMetrics:
         """
         Evaluate policy on test data.
