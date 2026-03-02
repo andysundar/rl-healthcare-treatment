@@ -11,12 +11,14 @@ Date: January 2026
 from .base_agent import BaseRLAgent
 from .cql import CQLAgent
 from .bcq import BCQAgent
+from .iql import IQLAgent, IQLConfig
 from .replay_buffer import ReplayBuffer, PrioritizedReplayBuffer
 from .trainer import OfflineRLTrainer, EvaluationManager
 from .networks import QNetwork, PolicyNetwork, ValueNetwork
 from .config import (
     CQLConfig,
     BCQConfig,
+    IQLConfig,
     TrainingConfig,
     SafetyConfig,
     HealthcareConfig,
@@ -31,6 +33,7 @@ __all__ = [
     'BaseRLAgent',
     'CQLAgent',
     'BCQAgent',
+    'IQLAgent',
     
     # Replay buffers
     'ReplayBuffer',
@@ -48,6 +51,7 @@ __all__ = [
     # Configuration
     'CQLConfig',
     'BCQConfig',
+    'IQLConfig',
     'TrainingConfig',
     'SafetyConfig',
     'HealthcareConfig',

@@ -85,8 +85,8 @@ class BaselineComparator:
         Returns:
             DataFrame with comparison results
         """
-        if self.test_data is None:
-            raise ValueError("Test data not set. Call set_test_data() first.")
+        if self.test_data is None or len(self.test_data) == 0:
+            raise ValueError("Test data not set or empty. Call set_test_data() with transitions.")
         
         if not self.baselines:
             raise ValueError("No baselines added. Call add_baseline() first.")
@@ -98,7 +98,8 @@ class BaselineComparator:
                 logger.info(f"Evaluating {name}...")
             
             try:
-                # Evaluate baseline
+                if not hasattr(baseline, 'evaluate') or not hasattr(baseline, 'select_action'):
+                    raise TypeError(f"Baseline {name} does not implement required BaselinePolicy interface")
                 metrics = baseline.evaluate(self.test_data)
                 
                 # Convert to dict

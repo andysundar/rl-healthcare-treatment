@@ -62,6 +62,20 @@ class CQLConfig:
             yaml.dump(self.to_dict(), f, default_flow_style=False)
 
 
+
+
+@dataclass
+class IQLConfig:
+    """Configuration for discrete-action IQL agent."""
+    state_dim: int
+    n_actions: int
+    hidden_dim: int = 128
+    gamma: float = 0.99
+    expectile: float = 0.7
+    beta: float = 3.0
+    lr: float = 3e-4
+    device: str = 'cpu'
+
 @dataclass
 class BCQConfig:
     """Configuration for Batch-Constrained Q-Learning agent."""
