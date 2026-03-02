@@ -81,15 +81,26 @@ from models.baselines import (
 #     CounterfactualExplainer, DecisionRuleExtractor, PersonalizationScorer)
 
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('integration_run.log'),
-        logging.StreamHandler()
-    ]
-)
+LOG_FILENAME = 'integration_run.log'
+
+
+def _configure_logging() -> None:
+    """Configure console + file logging for the integrated runner."""
+    project_root = Path(__file__).resolve().parent.parent
+    log_path = project_root / LOG_FILENAME
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_path, mode='a'),
+            logging.StreamHandler(),
+        ],
+        force=True,
+    )
+
+
+_configure_logging()
 logger = logging.getLogger(__name__)
 
 
