@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./quick_start.sh              # interactive scenario menu
-#   ./quick_start.sh --mode N     # run scenario N directly (N = 1-7)
+#   ./quick_start.sh --mode N     # run scenario N directly (N = 1-8)
 #   ./quick_start.sh --help       # print scenario descriptions
 
 set -e
@@ -68,6 +68,7 @@ elif [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "  3  Encoder + CQL       adds state autoencoder pre-training       (~20 min)"
     echo "  4  Extended state      vitals + med-history (16-dim state)       (~20 min)"
     echo "  5  Full pipeline       encoder + CQL + interpretability + transfer (~60 min)"
+    echo "  8  Defense bundle      complete thesis-defense artifact bundle     (~2-5 min)"
     echo ""
     echo "MIMIC-III scenarios (credentialed PhysioNet access required)"
     echo "  6  MIMIC sample        100-patient cohort, CQL training          (~30 min)"
@@ -100,8 +101,9 @@ if [ -z "$CHOICE" ]; then
     echo "  ──────────────────────────────────────────────────────────────"
     echo "  6) MIMIC sample        100-patient cohort                 (~30 min)"
     echo "  7) MIMIC full          complete pipeline w/ vitals        (hours)"
+    echo "  8) Defense bundle      full evidence/report artifact run  (~2-5 min)"
     echo ""
-    read -p "Enter choice (1-7): " CHOICE
+    read -p "Enter choice (1-8): " CHOICE
 fi
 
 # ── Helper: verify MIMIC-III directory ────────────────────────────────────────
@@ -267,6 +269,17 @@ case "$CHOICE" in
             --output-dir outputs/mimic_full
         ;;
 
+    # ── 8: Defense bundle ─────────────────────────────────────────────────────
+    8)
+        echo ""
+        print_status "Scenario 8: Thesis defense bundle (~2-5 min CPU)"
+        RUN_ID="defense_$(date +%Y%m%d_%H%M%S)"
+        python3 src/run_integrated_solution.py \
+            --defense-bundle \
+            --run-id "$RUN_ID" \
+            --seed 42
+        ;;
+
     *)
         print_error "Invalid choice: $CHOICE"
         echo "Run  ./quick_start.sh --help  to see available scenarios"
@@ -290,6 +303,7 @@ echo "  comparison.png                 multi-policy reward comparison"
 echo "  health_metrics.png             time-in-range and safety index"
 echo "  safety_clinical_heatmap.png    safety + clinical compliance heatmap"
 echo "  results_table.tex              LaTeX table for thesis"
+echo "  outputs/defense_<timestamp>/   full defense artifact bundle tree  (--mode 8)"
 echo ""
 echo "Optional artefacts (present when matching flags were used):"
 echo "  cql_training_curves.png        CQL loss/return curves    (--train-cql)"
