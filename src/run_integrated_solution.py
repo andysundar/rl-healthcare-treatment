@@ -941,19 +941,31 @@ class IntegratedSolutionRunner:
         logger.info(f"Training on device: {device}")
 
         # Prefer encoded data if encoder was pre-trained
+        state_dim = int(config.state_dim)
         if 'encoded_data' in self.results:
             train_data = self.results['encoded_data']['train']
             val_data   = self.results['encoded_data']['val']
-            state_dim  = self.results['encoder_wrapper'].state_dim
+            state_dim  = int(self.results['encoder_wrapper'].state_dim)
             logger.info(f"Using encoder embeddings as states (dim={state_dim})")
         elif data['source'] == 'synthetic':
             train_data = data['train']
             val_data   = data['val']
-            state_dim  = self._get_state_dim()
         else:
             train_data = self._convert_to_trajectory_format(data['train'])
             val_data   = self._convert_to_trajectory_format(data['val'])
-            state_dim  = self._get_state_dim()
+
+        # Always infer dimension from actual transitions to avoid config/data drift
+        # (e.g., MIMIC feature builders can emit a wider state than CLI defaults).
+        if train_data:
+            inferred_state_dim = len(np.asarray(train_data[0][0]).reshape(-1))
+            if inferred_state_dim != state_dim:
+                logger.warning(
+                    "CQL state_dim mismatch detected (configured=%s, inferred=%s). "
+                    "Using inferred dimension from training transitions.",
+                    state_dim,
+                    inferred_state_dim,
+                )
+            state_dim = inferred_state_dim
 
         # Rebuild agent with correct state_dim
         agent = CQLAgent(
