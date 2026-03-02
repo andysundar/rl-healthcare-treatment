@@ -217,6 +217,21 @@ class SafetyLayer:
         """
         self.safety_critic = safety_critic
     
+
+    def apply_discrete_action_mask(self, state_vector: np.ndarray, action_idx: int, n_actions: int) -> int:
+        """Simple safety mask for discrete insulin buckets using glucose bounds."""
+        glucose = float(state_vector[0]) if len(state_vector) > 0 else 120.0
+        # conservative rules: low glucose -> avoid high-dose buckets, high glucose -> avoid no-dose
+        forbidden = set()
+        if glucose < 80:
+            forbidden.update(range(max(0, n_actions // 2), n_actions))
+        if glucose > 220:
+            forbidden.add(0)
+        if action_idx in forbidden:
+            safe = [a for a in range(n_actions) if a not in forbidden]
+            return int(safe[0]) if safe else int(np.clip(action_idx, 0, n_actions - 1))
+        return int(action_idx)
+
     def _state_dict_to_array(self, state: Dict[str, Any]) -> np.ndarray:
         """
         Convert state dictionary to array
