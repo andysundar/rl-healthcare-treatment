@@ -749,8 +749,20 @@ class IntegratedSolutionRunner:
 
         # StateEncoderWrapper always passes the full flat state as "labs";
         # vital_dim / demo_dim stay 0 to avoid MPS device-mismatch on missing modalities.
+        configured_state_dim = int(self._get_state_dim())
+        raw_state_dim = configured_state_dim
+        if data.get('train'):
+            raw_state_dim = len(np.asarray(data['train'][0][0]).reshape(-1))
+            if raw_state_dim != configured_state_dim:
+                logger.warning(
+                    "Encoder input dim mismatch detected (configured=%s, inferred=%s). "
+                    "Using inferred dimension from training transitions.",
+                    configured_state_dim,
+                    raw_state_dim,
+                )
+
         enc_cfg = EncoderConfig(
-            lab_dim=self._get_state_dim(),
+            lab_dim=raw_state_dim,
             vital_dim=0,
             demo_dim=0,
             state_dim=getattr(self.config, 'encoder_state_dim', 64),
@@ -758,7 +770,7 @@ class IntegratedSolutionRunner:
         variational = (getattr(self.config, 'encoder_type', 'autoencoder') == 'vae')
         ae = PatientAutoencoder(enc_cfg, variational=variational)
         device = self.get_device()
-        wrapper = StateEncoderWrapper(ae, device=device, raw_state_dim=self._get_state_dim())
+        wrapper = StateEncoderWrapper(ae, device=device, raw_state_dim=raw_state_dim)
 
         checkpoint = getattr(self.config, 'encoder_checkpoint', None)
         if checkpoint:
@@ -941,19 +953,31 @@ class IntegratedSolutionRunner:
         logger.info(f"Training on device: {device}")
 
         # Prefer encoded data if encoder was pre-trained
+        state_dim = int(config.state_dim)
         if 'encoded_data' in self.results:
             train_data = self.results['encoded_data']['train']
             val_data   = self.results['encoded_data']['val']
-            state_dim  = self.results['encoder_wrapper'].state_dim
+            state_dim  = int(self.results['encoder_wrapper'].state_dim)
             logger.info(f"Using encoder embeddings as states (dim={state_dim})")
         elif data['source'] == 'synthetic':
             train_data = data['train']
             val_data   = data['val']
-            state_dim  = self._get_state_dim()
         else:
             train_data = self._convert_to_trajectory_format(data['train'])
             val_data   = self._convert_to_trajectory_format(data['val'])
-            state_dim  = self._get_state_dim()
+
+        # Always infer dimension from actual transitions to avoid config/data drift
+        # (e.g., MIMIC feature builders can emit a wider state than CLI defaults).
+        if train_data:
+            inferred_state_dim = len(np.asarray(train_data[0][0]).reshape(-1))
+            if inferred_state_dim != state_dim:
+                logger.warning(
+                    "CQL state_dim mismatch detected (configured=%s, inferred=%s). "
+                    "Using inferred dimension from training transitions.",
+                    state_dim,
+                    inferred_state_dim,
+                )
+            state_dim = inferred_state_dim
 
         # Rebuild agent with correct state_dim
         agent = CQLAgent(
