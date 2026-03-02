@@ -750,16 +750,54 @@ class IntegratedSolutionRunner:
         # StateEncoderWrapper always passes the full flat state as "labs";
         # vital_dim / demo_dim stay 0 to avoid MPS device-mismatch on missing modalities.
         configured_state_dim = int(self._get_state_dim())
-        raw_state_dim = configured_state_dim
-        if data.get('train'):
-            raw_state_dim = len(np.asarray(data['train'][0][0]).reshape(-1))
-            if raw_state_dim != configured_state_dim:
-                logger.warning(
-                    "Encoder input dim mismatch detected (configured=%s, inferred=%s). "
-                    "Using inferred dimension from training transitions.",
-                    configured_state_dim,
-                    raw_state_dim,
-                )
+
+        def _flat_dim(x) -> int:
+            return int(np.asarray(x).reshape(-1).shape[0])
+
+        train_dims = [_flat_dim(t[0]) for t in data.get('train', [])]
+        raw_state_dim = max(train_dims) if train_dims else configured_state_dim
+        if raw_state_dim != configured_state_dim:
+            logger.warning(
+                "Encoder input dim mismatch detected (configured=%s, inferred=%s). "
+                "Using inferred dimension from training transitions.",
+                configured_state_dim,
+                raw_state_dim,
+            )
+
+        def _normalize_transitions_state_dim(transitions, target_dim: int):
+            normalized = []
+            adjusted = 0
+            for s, a, r, ns, d in transitions:
+                s_arr = np.asarray(s, dtype=np.float32).reshape(-1)
+                ns_arr = np.asarray(ns, dtype=np.float32).reshape(-1)
+
+                if s_arr.shape[0] != target_dim:
+                    adjusted += 1
+                    if s_arr.shape[0] < target_dim:
+                        s_arr = np.pad(s_arr, (0, target_dim - s_arr.shape[0]), mode='constant')
+                    else:
+                        s_arr = s_arr[:target_dim]
+
+                if ns_arr.shape[0] != target_dim:
+                    adjusted += 1
+                    if ns_arr.shape[0] < target_dim:
+                        ns_arr = np.pad(ns_arr, (0, target_dim - ns_arr.shape[0]), mode='constant')
+                    else:
+                        ns_arr = ns_arr[:target_dim]
+
+                normalized.append((s_arr, a, r, ns_arr, d))
+            return normalized, adjusted
+
+        for split in ('train', 'val', 'test'):
+            if split in data:
+                data[split], adjusted = _normalize_transitions_state_dim(data[split], raw_state_dim)
+                if adjusted:
+                    logger.warning(
+                        "Normalized %s state vectors to dim=%s in '%s' split.",
+                        adjusted,
+                        raw_state_dim,
+                        split,
+                    )
 
         enc_cfg = EncoderConfig(
             lab_dim=raw_state_dim,
