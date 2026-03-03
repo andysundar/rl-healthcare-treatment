@@ -1147,7 +1147,8 @@ class IntegratedSolutionRunner:
 
         # Off-policy evaluation
         logger.info("Running off-policy evaluation...")
-        ope_evaluator = OffPolicyEvaluator()
+        q_function = self._build_ope_q_function(test_data)
+        ope_evaluator = OffPolicyEvaluator(q_function=q_function)
         behavior_policy = baselines.get('Behavior-Cloning', next(iter(baselines.values())))
         ope_results = {}
         ope_trajectories = self._to_ope_trajectories(test_data)
@@ -1246,6 +1247,73 @@ class IntegratedSolutionRunner:
                 logger.info(f"  Guideline Compliance: {c['guideline_compliance']:.2%}")
 
         logger.info("\nEvaluation complete")
+
+    def _build_ope_q_function(self, transitions):
+        """Build a callable Q-function for DR OPE.
+
+        Priority:
+        1) Reuse trained CQL critic when available.
+        2) Reuse trained IQL critic when available.
+        3) Fit a lightweight linear reward model as fallback.
+        """
+        cql_agent = self.results.get('cql', {}).get('agent')
+        if cql_agent is not None and hasattr(cql_agent, 'q_network1'):
+            logger.info("Using trained CQL critic as DR q_function")
+
+            def _cql_q_fn(state, action):
+                with torch.no_grad():
+                    s = np.asarray(state, dtype=np.float32).reshape(1, -1)
+                    a = np.asarray(action, dtype=np.float32).reshape(1, -1)
+                    s_t = torch.tensor(s, dtype=torch.float32, device=cql_agent.device)
+                    a_t = torch.tensor(a, dtype=torch.float32, device=cql_agent.device)
+                    q_val = cql_agent.q_network1(s_t, a_t).detach().cpu().numpy().reshape(-1)[0]
+                    return float(q_val)
+
+            return _cql_q_fn
+
+        iql_agent = self.results.get('iql', {}).get('agent')
+        if iql_agent is not None and hasattr(iql_agent, 'q'):
+            logger.info("Using trained IQL critic as DR q_function")
+
+            def _iql_q_fn(state, action):
+                with torch.no_grad():
+                    s = np.asarray(state, dtype=np.float32).reshape(1, -1)
+                    a = int(np.clip(np.rint(np.asarray(action).reshape(-1)[0]), 0, iql_agent.config.n_actions - 1))
+                    s_t = torch.tensor(s, dtype=torch.float32, device=iql_agent.device)
+                    q_all = iql_agent.q(s_t)
+                    return float(q_all[0, a].item())
+
+            return _iql_q_fn
+
+        logger.info("No trained critic found; fitting linear fallback q_function for DR")
+        states, actions, rewards = [], [], []
+        for s, a, r, _, _ in transitions:
+            s_arr = np.asarray(s, dtype=np.float32).reshape(-1)
+            a_arr = np.asarray(a, dtype=np.float32).reshape(-1)
+            states.append(s_arr)
+            actions.append(a_arr)
+            rewards.append(float(r))
+
+        if not states:
+            logger.warning("Transitions empty; using zero q_function fallback")
+            return lambda state, action: 0.0
+
+        s_mat = np.stack(states)
+        a_mat = np.stack(actions)
+        x = np.concatenate([s_mat, a_mat, np.ones((s_mat.shape[0], 1), dtype=np.float32)], axis=1)
+        y = np.asarray(rewards, dtype=np.float32)
+
+        l2 = 1e-3
+        reg = l2 * np.eye(x.shape[1], dtype=np.float32)
+        weights = np.linalg.solve(x.T @ x + reg, x.T @ y)
+
+        def _linear_q_fn(state, action):
+            s_arr = np.asarray(state, dtype=np.float32).reshape(-1)
+            a_arr = np.asarray(action, dtype=np.float32).reshape(-1)
+            feat = np.concatenate([s_arr, a_arr, np.array([1.0], dtype=np.float32)], axis=0)
+            return float(feat @ weights)
+
+        return _linear_q_fn
 
     def stage_7b_policy_distillation(self):
         """Distill learned policy to shallow decision tree and save rules/fidelity."""
