@@ -205,6 +205,26 @@ class DecisionRuleExtractor:
         self.config = config
         self._tree = None
         self._feature_names = config.feature_names
+        self._resolved_feature_names: List[str] = []
+
+    def _get_feature_names_for_tree(self) -> List[str]:
+        """Return feature names aligned with fitted tree input dimensionality."""
+        if self._tree is None:
+            raise RuntimeError("Call fit() first.")
+
+        n_tree_features = int(self._tree.n_features_in_)
+        configured_names = list(self._feature_names)
+
+        if len(configured_names) >= n_tree_features:
+            return configured_names[:n_tree_features]
+
+        # Some pipelines (e.g., encoded state vectors) increase dimensionality.
+        # Preserve known names and auto-name any additional dimensions.
+        missing = n_tree_features - len(configured_names)
+        extra_names = [
+            f'feature_{len(configured_names) + i}' for i in range(missing)
+        ]
+        return configured_names + extra_names
 
     def fit(
         self,
@@ -241,6 +261,7 @@ class DecisionRuleExtractor:
         logger.info(f"Decision tree fitted on {len(states)} samples "
                     f"(depth={self._tree.get_depth()}, "
                     f"leaves={self._tree.get_n_leaves()})")
+        self._resolved_feature_names = self._get_feature_names_for_tree()
         return self
 
     def _query_agent(self, states, agent, encoder_wrapper) -> np.ndarray:
@@ -269,7 +290,7 @@ class DecisionRuleExtractor:
         from sklearn.tree import export_text
         rule_text = export_text(
             self._tree,
-            feature_names=self._feature_names[:len(self._feature_names)],
+            feature_names=self._resolved_feature_names,
         )
         # Split into individual rule lines
         rules = [line.strip() for line in rule_text.splitlines() if line.strip()]
@@ -282,7 +303,7 @@ class DecisionRuleExtractor:
         importances = self._tree.feature_importances_
         return {
             name: float(imp)
-            for name, imp in zip(self._feature_names, importances)
+            for name, imp in zip(self._resolved_feature_names, importances)
         }
 
     def fidelity_score(

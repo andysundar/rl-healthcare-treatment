@@ -31,7 +31,7 @@ This project develops a **safety-constrained offline reinforcement learning fram
 | Domain-adaptation policy transfer | `src/models/policy_transfer/transfer.py` |
 | Extended state: vital signs from CHARTEVENTS | `src/data/mimic_loader.py` (`--use-vitals`) |
 | Extended state: medication history | `src/data/mimic_loader.py` (`--use-med-history`) |
-| Thesis-quality visualisation artefacts | `src/run_integrated_solution.py` |
+| Thesis-quality visualisation artifacts | `src/run_integrated_solution.py` |
 
 ---
 
@@ -316,7 +316,7 @@ Requires MIMIC-III credentialed access (see [PhysioNet](https://physionet.org/co
 
 ---
 
-## Generated Output Artefacts
+## Generated Output artifacts
 
 Every run produces the following under `--output-dir`:
 
@@ -362,7 +362,7 @@ rl-healthcare-treatment/
 │       └── clinical_metrics.py      # ClinicalEvaluator
 ├── tests/
 │   └── test_pdf_alignment.py        # 23-test suite covering all PDF requirements (T01–T23)
-├── outputs/                         # Generated artefacts (git-ignored)
+├── outputs/                         # Generated artifacts (git-ignored)
 ├── requirements.txt
 └── README.md
 ```
