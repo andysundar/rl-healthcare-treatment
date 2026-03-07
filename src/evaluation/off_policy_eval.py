@@ -1,4 +1,4 @@
-"""Off-policy evaluation utilities with WIS/DR, ESS, clipping, and bootstrap CI."""
+"""Off-policy evaluation utilities with IS/WIS/DR/DM, ESS, clipping, and bootstrap CI."""
 
 import logging
 from dataclasses import dataclass
@@ -79,54 +79,108 @@ class OffPolicyEvaluator:
         lo, hi = np.percentile(boots, [2.5, 97.5])
         return float(np.std(boots)), float(lo), float(hi)
 
-    def evaluate(self, policy, behavior_policy, trajectories: List[Trajectory], methods=['wis', 'dr']):
+    def evaluate(self, policy, behavior_policy, trajectories: List[Trajectory], methods=['is', 'wis', 'dr', 'dm']):
+        if not trajectories:
+            return {}
+
         weights, returns = [], []
+        clipped_steps = 0
+        total_steps = 0
         support_issues = 0
+        ratios_by_traj: List[List[float]] = []
+
         for traj in trajectories:
-            w, g = self._trajectory_weight_and_return(policy, behavior_policy, traj)
-            weights.append(w); returns.append(g)
+            w = 1.0
+            g = 0.0
+            traj_ratios = []
+            for t in range(len(traj)):
+                pi = self._get_prob(policy, traj.states[t], traj.actions[t])
+                b = self._get_prob(behavior_policy, traj.states[t], traj.actions[t])
+                raw_ratio = pi / (b + 1e-8)
+                ratio = np.clip(raw_ratio, 0.0, self.clip_ratio)
+                if ratio < raw_ratio:
+                    clipped_steps += 1
+                total_steps += 1
+                traj_ratios.append(float(ratio))
+                w *= ratio
+                g += (self.gamma ** t) * float(traj.rewards[t])
+
+            weights.append(w)
+            returns.append(g)
+            ratios_by_traj.append(traj_ratios)
             if w == 0.0 or w >= self.clip_ratio ** max(1, len(traj) // 4):
                 support_issues += 1
 
         weights = np.asarray(weights, dtype=np.float64)
         returns = np.asarray(returns, dtype=np.float64)
         ess = self.effective_sample_size(weights)
+        clip_fraction = float(clipped_steps / max(1, total_steps))
 
         warnings = []
+        unreliable = False
         if ess < max(5.0, 0.1 * len(trajectories)):
             warnings.append(f"Low ESS detected ({ess:.2f}/{len(trajectories)}).")
+            unreliable = True
         if support_issues / max(1, len(trajectories)) > 0.2:
             warnings.append("Potential support mismatch: many highly clipped/zero-weight trajectories.")
+            unreliable = True
         if np.std(weights) > 10 * (np.mean(weights) + 1e-8):
             warnings.append("High variance in importance weights.")
+            unreliable = True
+        if clip_fraction > 0.5:
+            warnings.append(f"High clipping fraction ({clip_fraction:.2%}).")
+            unreliable = True
+
+        base_meta = {
+            'ess': ess,
+            'clip_ratio': self.clip_ratio,
+            'clip_fraction': clip_fraction,
+            'reliability_flag': 'unreliable' if unreliable else 'reliable',
+            'warnings': warnings,
+        }
 
         results = {}
+        if 'is' in methods:
+            is_vals = weights * returns
+            std, lo, hi = self.bootstrap_ci(is_vals)
+            results['is'] = OPEResult(float(np.mean(is_vals)), std, (lo, hi), 'is', len(trajectories), dict(base_meta))
+
         if 'wis' in methods:
             wis = float(np.sum(weights * returns) / (np.sum(weights) + 1e-8))
-            weighted_values = (weights * returns) / (np.mean(weights) + 1e-8)
-            std, lo, hi = self.bootstrap_ci(weighted_values)
-            results['wis'] = OPEResult(wis, std, (lo, hi), 'wis', len(trajectories), {
-                'ess': ess, 'clip_ratio': self.clip_ratio, 'warnings': warnings,
-            })
+            wis_vals = (weights * returns) / (np.mean(weights) + 1e-8)
+            std, lo, hi = self.bootstrap_ci(wis_vals)
+            results['wis'] = OPEResult(wis, std, (lo, hi), 'wis', len(trajectories), dict(base_meta))
+
+        if 'dm' in methods:
+            if self.q_function is None:
+                logger.warning("DM requested but q_function is None; skipping DM")
+            else:
+                dm_vals = []
+                for traj in trajectories:
+                    v = 0.0
+                    for t in range(len(traj)):
+                        v += (self.gamma ** t) * float(self.q_function(traj.states[t], traj.actions[t]))
+                    dm_vals.append(v)
+                dm_vals = np.asarray(dm_vals, dtype=np.float64)
+                std, lo, hi = self.bootstrap_ci(dm_vals)
+                results['dm'] = OPEResult(float(np.mean(dm_vals)), std, (lo, hi), 'dm', len(trajectories), dict(base_meta))
 
         if 'dr' in methods:
             if self.q_function is None:
                 logger.warning("DR requested but q_function is None; skipping DR")
             else:
                 dr_vals = []
-                for traj in trajectories:
+                for traj, traj_ratios in zip(trajectories, ratios_by_traj):
                     val = 0.0
                     for t in range(len(traj)):
                         s, a, r = traj.states[t], traj.actions[t], float(traj.rewards[t])
-                        rho = np.clip(self._get_prob(policy, s, a) / (self._get_prob(behavior_policy, s, a) + 1e-8), 0.0, self.clip_ratio)
+                        rho = float(traj_ratios[t])
                         q_sa = float(self.q_function(s, a))
                         val += (self.gamma ** t) * (rho * (r - q_sa) + q_sa)
                     dr_vals.append(val)
-                dr_vals = np.asarray(dr_vals)
+                dr_vals = np.asarray(dr_vals, dtype=np.float64)
                 std, lo, hi = self.bootstrap_ci(dr_vals)
-                results['dr'] = OPEResult(float(np.mean(dr_vals)), std, (lo, hi), 'dr', len(trajectories), {
-                    'ess': ess, 'clip_ratio': self.clip_ratio, 'warnings': warnings,
-                })
+                results['dr'] = OPEResult(float(np.mean(dr_vals)), std, (lo, hi), 'dr', len(trajectories), dict(base_meta))
         return results
 
 

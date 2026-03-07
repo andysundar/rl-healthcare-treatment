@@ -18,13 +18,20 @@ Date: February 2026
 import argparse
 import logging
 import sys
+import os
 from pathlib import Path
 from datetime import datetime
 import json
+import hashlib
+import subprocess
+from typing import Dict, List, Tuple, Any
 
 import numpy as np
 import pandas as pd
 import torch
+
+os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
+os.environ.setdefault('XDG_CACHE_HOME', '/tmp')
 import matplotlib.pyplot as plt
 
 # --- path setup MUST come before any local imports ---
@@ -53,7 +60,6 @@ from reporting import (
     ArtifactManager,
     plot_ope_returns_ci,
     plot_safety_vs_performance,
-    plot_distilled_tree_placeholder,
     build_defense_report,
     build_one_page_summary,
     build_figures_index,
@@ -162,6 +168,58 @@ class IntegratedSolutionRunner:
         """Return scalar state dimension based on active feature flags."""
         return len(self._get_state_cols())
 
+    def _get_git_commit(self) -> str:
+        """Return current git commit hash, if available."""
+        try:
+            out = subprocess.check_output(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=Path(__file__).resolve().parent.parent,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            return out
+        except Exception:
+            return "unknown"
+
+    def _provenance(self) -> Dict[str, Any]:
+        """Standard provenance metadata attached to exported artifacts."""
+        data = self.results.get('data', {})
+        n_train = len(data.get('train', []))
+        n_val = len(data.get('val', []))
+        n_test = len(data.get('test', []))
+        return {
+            'run_timestamp': datetime.now().isoformat(),
+            'seed': int(getattr(self.config, 'seed', 42)),
+            'git_commit': self._get_git_commit(),
+            'data_source': data.get('source', 'unknown'),
+            'n_patients': int(len(data.get('patients', data.get('cohort', [])))),
+            'n_trajectories': int(n_train + n_val + n_test),
+            'state_dimension': int(self._get_state_dim()),
+            'action_dimension': 1,
+            'reward_definition': 'in_range - 2*hypoglycemia - hyperglycemia + 0.5*medication_taken',
+            'output_directory': str(self.output_dir),
+        }
+
+    def _write_json_with_provenance(self, path: Path, payload: Dict[str, Any]) -> None:
+        out = dict(payload)
+        out['provenance'] = self._provenance()
+        with open(path, 'w') as f:
+            json.dump(out, f, indent=2)
+
+    def _normalize_output_dir_by_data_source(self) -> None:
+        """Ensure folder naming reflects the actual data source."""
+        source = self.results.get('data', {}).get('source', '').lower()
+        cur_name = self.output_dir.name.lower()
+        if source == 'synthetic' and 'mimic' in cur_name:
+            new_name = self.output_dir.name.lower().replace('mimic', 'synthetic')
+            new_dir = self.output_dir.parent / new_name
+            new_dir.mkdir(parents=True, exist_ok=True)
+            logger.warning(
+                "Output directory name '%s' mismatches source '%s'. Using '%s' instead.",
+                self.output_dir.name, source, new_dir,
+            )
+            self.output_dir = new_dir
+
     def run_full_pipeline(self):
         """Run complete end-to-end pipeline."""
         logger.info("\n" + "=" * 80)
@@ -188,7 +246,7 @@ class IntegratedSolutionRunner:
 
         self.stage_4b_iql_training()
 
-        if self.config.mode in ['full', 'train-eval', 'eval-only']:
+        if self.config.mode in ['full', 'train-eval', 'eval-only', 'synthetic']:
             self.stage_5_evaluation()
 
         # Policy transfer (opt-in)
@@ -297,52 +355,40 @@ class IntegratedSolutionRunner:
                     'cost_return': float(sres.get('safety_index', 0.0)),
                 })
 
-        subgroup_rows = []
-        rng = np.random.default_rng(42)
-        for group in ['younger', 'older']:
-            for policy in list(self.results.get('evaluation', {}).get('safety', {}).keys()):
-                subgroup_rows.append({'subgroup': group, 'policy': policy, 'metric': 'placeholder_rate', 'value': float(rng.uniform(0.3, 0.7))})
-
         am.write_eval_tables(
             metrics_df=baseline_df if len(baseline_df) else pd.DataFrame(columns=['policy']),
             ope_rows=ope_rows,
             safety_rows=safety_rows,
-            subgroup_rows=subgroup_rows,
+            subgroup_rows=[],
             warnings_md='\n'.join(warnings_lines) + '\n',
         )
 
-        # Training artifacts placeholders / copied files
+        # Training artifacts
         train_curves = am.dirs['train'] / 'training_curves'
         (am.dirs['train'] / 'training_log.txt').write_text('Training executed via integrated runner.\n')
         src_base_plot = self.output_dir / 'baseline_comparison.png'
         if src_base_plot.exists():
             import shutil
             shutil.copy2(src_base_plot, train_curves / 'baseline_losses.png')
+        src_cql_plot = self.output_dir / 'cql_training_curves.png'
+        if src_cql_plot.exists():
+            import shutil
+            shutil.copy2(src_cql_plot, train_curves / 'cql_losses.png')
         else:
-            (train_curves / 'baseline_losses.png').write_text('not available\n')
-        (train_curves / 'cql_losses.png').write_text('CQL disabled in defense bundle fast mode; IQL used.\n')
+            (am.run_root / 'warnings').mkdir(parents=True, exist_ok=True)
+            (am.run_root / 'warnings' / 'TRAINING_ARTIFACTS_WARNING.md').write_text(
+                "# TRAINING_ARTIFACTS_WARNING\n"
+                "- CQL curve artifact missing; no placeholder emitted.\n"
+            )
 
-        ope_df = pd.DataFrame(ope_rows)
-        plot_ope_returns_ci(ope_df, am.dirs['eval'] / 'ope_returns_ci.png')
-        safety_df = pd.DataFrame(safety_rows)
-        plot_safety_vs_performance(safety_df, ope_df, am.dirs['eval'] / 'safety_vs_performance.png')
-
-        # Confusion matrix (discrete action demo)
-        cm_path = am.dirs['eval'] / 'confusion_matrix.png'
-        fig, ax = plt.subplots(figsize=(4, 4))
-        cm = np.array([[42, 8], [11, 39]])
-        im = ax.imshow(cm, cmap='Blues')
-        for i in range(2):
-            for j in range(2):
-                ax.text(j, i, str(cm[i, j]), ha='center', va='center', color='black')
-        ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
-        ax.set_xticklabels(['a0', 'a1']); ax.set_yticklabels(['a0', 'a1'])
-        ax.set_title('Policy vs behavior action confusion')
-        fig.colorbar(im, ax=ax, fraction=0.046)
-        fig.tight_layout(); fig.savefig(cm_path, dpi=160); plt.close(fig)
-
-        # checkpoint placeholder
-        (am.dirs['train'] / 'checkpoints' / 'README.txt').write_text('Checkpoint artifacts placeholder for fast bundle mode.\n')
+        # Plots are optional in constrained/headless environments.
+        # If unavailable, keep numeric artifacts and emit warning.
+        (am.run_root / 'warnings').mkdir(parents=True, exist_ok=True)
+        (am.run_root / 'warnings' / 'PLOT_ARTIFACTS_WARNING.md').write_text(
+            "# PLOT_ARTIFACTS_WARNING\n"
+            "- OPE/safety plots skipped in defense-bundle fast mode.\n"
+            "- Use root CSV artifacts for evidence.\n"
+        )
 
         # Interpretability artifacts
         interp_dir = am.dirs['interp']
@@ -350,8 +396,14 @@ class IntegratedSolutionRunner:
         rules_text = ''
         if (src_interp / 'policy_rules.txt').exists():
             rules_text = (src_interp / 'policy_rules.txt').read_text()
-        (interp_dir / 'distilled_tree.txt').write_text(rules_text or 'No distillation rules available\n')
-        plot_distilled_tree_placeholder(interp_dir / 'distilled_tree.png', rules_text or 'No rules available')
+        if rules_text:
+            (interp_dir / 'distilled_tree.txt').write_text(rules_text)
+        else:
+            (am.run_root / 'warnings').mkdir(parents=True, exist_ok=True)
+            (am.run_root / 'warnings' / 'INTERPRETABILITY_ARTIFACTS_WARNING.md').write_text(
+                "# INTERPRETABILITY_ARTIFACTS_WARNING\n"
+                "- Distilled tree text missing; artifact omitted.\n"
+            )
 
         fidelity = 0.0
         if (src_interp / 'distillation_metrics.json').exists():
@@ -359,8 +411,8 @@ class IntegratedSolutionRunner:
                 fidelity = float(json.loads((src_interp / 'distillation_metrics.json').read_text()).get('fidelity', 0.0))
             except Exception:
                 fidelity = 0.0
-        pd.DataFrame([{'policy': 'IQL', 'fidelity': fidelity}]).to_csv(interp_dir / 'distillation_fidelity.csv', index=False)
-        (interp_dir / 'example_explanations.md').write_text('# Example Explanations\n- Placeholder examples generated from distilled policy path.\n')
+        if fidelity > 0:
+            pd.DataFrame([{'policy': 'IQL', 'fidelity': fidelity}]).to_csv(interp_dir / 'distillation_fidelity.csv', index=False)
 
         # Demo/final reports
         am.write_demo_assets()
@@ -390,6 +442,7 @@ class IntegratedSolutionRunner:
                 data = self.prepare_mimic_data()
 
             self.results['data'] = data
+            self._normalize_output_dir_by_data_source()
             logger.info("Data preparation complete")
 
         except Exception as e:
@@ -398,6 +451,7 @@ class IntegratedSolutionRunner:
                 logger.info("Falling back to synthetic data...")
                 data = self.prepare_synthetic_data()
                 self.results['data'] = data
+                self._normalize_output_dir_by_data_source()
             else:
                 raise
 
@@ -876,6 +930,7 @@ class IntegratedSolutionRunner:
             logger.info("Generating synthetic data for baselines...")
             data = self.prepare_synthetic_data()
             self.results['data'] = data
+            self._normalize_output_dir_by_data_source()
             test_data = data['test']
             train_data = data['train']
 
@@ -937,13 +992,15 @@ class IntegratedSolutionRunner:
         )
         baselines['Behavior-Cloning'] = bc_policy
 
-        logger.info("\nEvaluating all baselines...")
-        comparison_path = self.output_dir / 'baseline_comparison_report.md'
-        results_df = compare_all_baselines(
-            test_data=test_data,
-            baselines_dict=baselines,
-            output_path=str(comparison_path)
+        logger.info("\nEvaluating all baselines with per-policy rollouts...")
+        rollout_payload = self._run_policy_rollout_evaluation(
+            policies=baselines,
+            train_data=train_data,
+            eval_data=test_data,
+            export_prefix='baseline',
         )
+        results_df = rollout_payload['summary_df']
+        self._export_baseline_reports(results_df)
 
         logger.info("\n" + "=" * 60)
         logger.info("BASELINE COMPARISON RESULTS")
@@ -954,9 +1011,11 @@ class IntegratedSolutionRunner:
             'policies': baselines,
             'comparison': results_df,
             'test_data': test_data,
+            'raw_eval_path': rollout_payload['raw_eval_path'],
+            'episode_summary_path': rollout_payload['episode_summary_path'],
         }
-
-        logger.info(f"Baseline training complete. Report saved to {comparison_path}")
+        self.results['baseline_rollouts'] = rollout_payload
+        logger.info("Baseline training complete")
 
     # ------------------------------------------------------------------
     # Stage 4
@@ -1143,23 +1202,58 @@ class IntegratedSolutionRunner:
             return
 
         test_data = self.results['baselines']['test_data']
-        baselines = self.results['baselines']['policies']
+        train_data = self.results['data']['train']
+        eval_policies = dict(self.results['baselines']['policies'])
+        if 'iql' in self.results and self.results['iql'].get('agent') is not None:
+            eval_policies['IQL'] = self.results['iql']['agent']
+
+        # Per-policy rollouts used as source of truth for reward/safety summaries.
+        rollout_eval = self._run_policy_rollout_evaluation(
+            policies=eval_policies,
+            train_data=train_data,
+            eval_data=test_data,
+            export_prefix='evaluation',
+        )
+        summary_df = rollout_eval['summary_df']
 
         # Off-policy evaluation
         logger.info("Running off-policy evaluation...")
-        q_function = self._build_ope_q_function(test_data)
-        ope_evaluator = OffPolicyEvaluator(q_function=q_function)
-        behavior_policy = baselines.get('Behavior-Cloning', next(iter(baselines.values())))
+        q_function = self._build_ope_q_function(train_data)
+        ope_evaluator = OffPolicyEvaluator(q_function=q_function, clip_ratio=10.0, n_bootstrap=300, seed=getattr(self.config, 'seed', 42))
+        behavior_policy = eval_policies.get('Behavior-Cloning', next(iter(eval_policies.values())))
         ope_results = {}
         ope_trajectories = self._to_ope_trajectories(test_data)
-        for name, policy in baselines.items():
-            logger.info(f"  Evaluating {name}...")
+
+        class _ProbWrapper:
+            def __init__(self, base_policy, sigma: float):
+                self.base_policy = base_policy
+                self.sigma = sigma
+
+            def select_action(self, state, deterministic=True):
+                return self.base_policy.select_action(state, deterministic=deterministic)
+
+            def get_action_probability(self, state, action):
+                if hasattr(self.base_policy, 'get_action_probability'):
+                    return float(self.base_policy.get_action_probability(state, action))
+                pred = np.asarray(self.base_policy.select_action(state, deterministic=True), dtype=np.float32).reshape(-1)
+                act = np.asarray(action, dtype=np.float32).reshape(-1)
+                var = self.sigma ** 2
+                logp = -0.5 * np.sum(((act - pred) ** 2) / var + np.log(2 * np.pi * var))
+                return float(np.exp(np.clip(logp, -40, 5)))
+
+        action_values = np.asarray([float(np.asarray(t[1]).reshape(-1)[0]) for t in train_data], dtype=np.float32)
+        sigma = float(max(0.05, np.std(action_values)))
+        wrapped_behavior = _ProbWrapper(behavior_policy, sigma=sigma)
+        ope_rows = []
+        for name, policy in eval_policies.items():
+            logger.info(f"  OPE for {name}...")
             try:
+                wrapped_target = _ProbWrapper(policy, sigma=sigma)
                 results = ope_evaluator.evaluate(
-                    policy=policy,
-                    behavior_policy=behavior_policy,
+                    policy=wrapped_target,
+                    behavior_policy=wrapped_behavior,
                     trajectories=ope_trajectories,
-                    methods=['wis', 'dr'],
+                    methods=['is', 'wis', 'dr', 'dm'],
                 )
                 ope_results[name] = {
                     m: {
@@ -1169,75 +1263,82 @@ class IntegratedSolutionRunner:
                         'metadata': v.metadata,
                     } for m, v in results.items()
                 }
+                for estimator, payload in ope_results[name].items():
+                    meta = payload.get('metadata', {})
+                    ope_rows.append({
+                        'policy': name,
+                        'estimator': estimator.upper(),
+                        'value_estimate': payload['value_estimate'],
+                        'std_error': payload['std_error'],
+                        'ci_lower': payload['confidence_interval'][0],
+                        'ci_upper': payload['confidence_interval'][1],
+                        'ess': float(meta.get('ess', 0.0)),
+                        'reliability_flag': str(meta.get('reliability_flag', 'unknown')),
+                        'warning': " | ".join(meta.get('warnings', [])),
+                        'clipping_threshold_used': float(meta.get('clip_ratio', np.nan)),
+                    })
             except Exception as e:
                 logger.warning(f"    OPE failed for {name}: {e}")
                 ope_results[name] = None
 
-        # Safety metrics
-        logger.info("\nComputing safety metrics...")
-        eval_config = EvaluationConfig()
-        safety_evaluator = SafetyEvaluator(eval_config)
-        # Evaluators expect dict-format trajectories; test_data is flat tuples
-        traj_dicts = self._tuples_to_traj_dicts(test_data)
+        ope_df = pd.DataFrame(ope_rows)
+        if not ope_df.empty:
+            for c in ['data_source', 'seed', 'git_commit']:
+                if c == 'data_source':
+                    ope_df[c] = self.results.get('data', {}).get('source', 'unknown')
+                elif c == 'seed':
+                    ope_df[c] = int(getattr(self.config, 'seed', 42))
+                else:
+                    ope_df[c] = self._get_git_commit()
+            ope_df.to_csv(self.output_dir / 'ope_estimates.csv', index=False)
+
+            pivot = ope_df.pivot_table(index='policy', columns='estimator', values='value_estimate', aggfunc='first')
+            for col in ['WIS', 'DR']:
+                if col in pivot.columns and len(pivot[col].dropna().unique()) <= 1 and len(pivot[col].dropna()) > 1:
+                    raise RuntimeError(f"Degenerate OPE detected: all policies share identical {col} estimate.")
+
+        # Safety/clinical metrics from rollout summary (single source of truth).
         safety_results = {}
-        for name, policy in baselines.items():
-            logger.info(f"  {name}...")
-            try:
-                safety_result = safety_evaluator.evaluate(traj_dicts)
-                safety_index = safety_result.safety_index
-                safety_results[name] = {
-                    'safety_index': safety_index,
-                    'safety_level': (
-                        'HIGH' if safety_index > 0.95
-                        else 'MEDIUM' if safety_index > 0.85
-                        else 'LOW'
-                    ),
-                }
-            except Exception as e:
-                logger.warning(f"    Safety computation failed for {name}: {e}")
-                safety_results[name] = None
-
-        # Clinical metrics
-        logger.info("\nComputing clinical metrics...")
-        clinical_evaluator = ClinicalEvaluator(eval_config)
         clinical_results = {}
-        for name, policy in baselines.items():
-            logger.info(f"  {name}...")
-            try:
-                tir = clinical_evaluator.compute_time_in_range(traj_dicts)
-                compliance = float(np.mean(list(tir.values()))) if tir else 0.0
-                clinical_results[name] = {'guideline_compliance': compliance}
-            except Exception as e:
-                logger.warning(f"    Clinical metrics failed for {name}: {e}")
-                clinical_results[name] = None
-
-        if 'iql' in self.results:
-            from models.safety.config import SafetyConfig as SafetyLayerConfig
-            from models.safety.safety_layer import SafetyLayer
-            iql = self.results['iql']['agent']
-            n_actions = self.results['iql']['n_actions']
-            safety_layer = SafetyLayer(SafetyLayerConfig())
-            violations = 0
-            for s, _, _, _, _ in test_data:
-                a = int(iql.select_action(s, deterministic=True)[0])
-                if safety_layer.apply_discrete_action_mask(s, a, n_actions) != a:
-                    violations += 1
-            safety_results['IQL'] = {
-                'unsafe_action_rate': violations / max(1, len(test_data)),
-                'constraint_satisfaction_rate': 1.0 - (violations / max(1, len(test_data))),
+        for policy_name, row in summary_df.iterrows():
+            safety_results[policy_name] = {
+                'unsafe_action_rate': float(row['unsafe_action_rate']),
+                'safety_violations_count': int(row['safety_violations_count']),
+                'constraint_satisfaction_rate': float(row['constraint_satisfaction_rate']),
+                'safety_index': float(row['constraint_satisfaction_rate']),
+                'safety_level': (
+                    'HIGH' if row['constraint_satisfaction_rate'] > 0.95
+                    else 'MEDIUM' if row['constraint_satisfaction_rate'] > 0.85
+                    else 'LOW'
+                ),
             }
+            clinical_results[policy_name] = {
+                'guideline_compliance': float(row['constraint_satisfaction_rate'])
+            }
+
+        safety_df = summary_df.reset_index()[[
+            'policy', 'unsafe_action_rate', 'safety_violations_count', 'constraint_satisfaction_rate'
+        ]].copy()
+        safety_df['data_source'] = self.results.get('data', {}).get('source', 'unknown')
+        safety_df['seed'] = int(getattr(self.config, 'seed', 42))
+        safety_df['git_commit'] = self._get_git_commit()
+        safety_df.to_csv(self.output_dir / 'safety_summary.csv', index=False)
 
         self.results['evaluation'] = {
             'ope': ope_results,
+            'ope_table': ope_df,
             'safety': safety_results,
             'clinical': clinical_results,
+            'rollout_summary': summary_df,
+            'rollout_raw_path': rollout_eval['raw_eval_path'],
+            'rollout_episode_summary_path': rollout_eval['episode_summary_path'],
         }
 
         logger.info("\n" + "=" * 60)
         logger.info("EVALUATION SUMMARY")
         logger.info("=" * 60)
 
-        for name in baselines.keys():
+        for name in eval_policies.keys():
             logger.info(f"\n{name}:")
             if safety_results.get(name):
                 s = safety_results[name]
@@ -1319,26 +1420,133 @@ class IntegratedSolutionRunner:
         """Distill learned policy to shallow decision tree and save rules/fidelity."""
         if not getattr(self.config, 'run_distillation', True):
             return
-        if 'iql' not in self.results or 'data' not in self.results:
+        if 'data' not in self.results:
             return
         from sklearn.tree import DecisionTreeClassifier, export_text
         data = self.results['data']
-        agent = self.results['iql']['agent']
+        agent = None
+        agent_name = None
+        if self.results.get('cql', {}).get('agent') is not None:
+            agent = self.results['cql']['agent']
+            agent_name = 'CQL'
+        elif self.results.get('iql', {}).get('agent') is not None:
+            agent = self.results['iql']['agent']
+            agent_name = 'IQL'
+        if agent is None:
+            return
+
         states = np.array([t[0] for t in data['test']], dtype=np.float32)
         if len(states) == 0:
             return
-        y = np.array([int(agent.select_action(s, deterministic=True)[0]) for s in states], dtype=int)
+        raw_actions = []
+        for s in states:
+            a = agent.select_action(s, deterministic=True)
+            raw_actions.append(float(np.asarray(a).reshape(-1)[0]))
+        raw_actions = np.asarray(raw_actions, dtype=np.float32)
+        q1, q2 = np.quantile(raw_actions, [0.33, 0.67])
+        y = np.digitize(raw_actions, bins=[q1, q2]).astype(int)
         tree = DecisionTreeClassifier(max_depth=3, random_state=42)
         tree.fit(states, y)
         pred = tree.predict(states)
         fidelity = float(np.mean(pred == y))
         out_dir = self.output_dir / 'interpretability'
         out_dir.mkdir(parents=True, exist_ok=True)
-        rules = export_text(tree)
-        (out_dir / 'policy_rules.txt').write_text(rules)
-        (out_dir / 'distillation_metrics.json').write_text(json.dumps({'fidelity': fidelity}, indent=2))
-        self.results['policy_distillation'] = {'fidelity': fidelity, 'rules_path': str(out_dir / 'policy_rules.txt')}
-        logger.info(f"Policy distillation complete. fidelity={fidelity:.4f}")
+        feature_names = list(self.results.get('data', {}).get('state_cols', BASE_STATE_COLS))
+        if len(feature_names) < states.shape[1]:
+            feature_names.extend([f'feature_{i}' for i in range(len(feature_names), states.shape[1])])
+        rules = export_text(tree, feature_names=list(feature_names[:states.shape[1]]))
+
+        importances = {
+            (feature_names[i] if i < len(feature_names) else f'feature_{i}'): float(v)
+            for i, v in enumerate(tree.feature_importances_)
+        }
+        tree_depth = int(tree.get_depth())
+        all_zero_importance = all(abs(v) <= 1e-12 for v in importances.values())
+        if tree_depth == 0 or all_zero_importance:
+            (self.output_dir / 'INTERPRETABILITY_WARNING.md').write_text(
+                "# INTERPRETABILITY_WARNING\n"
+                "- Surrogate tree is degenerate (single leaf or zero importances).\n"
+                "- decision_rules.txt and feature_importances.json omitted.\n"
+            )
+            for p in [self.output_dir / 'decision_rules.txt', self.output_dir / 'feature_importances.json']:
+                if p.exists():
+                    p.unlink()
+        else:
+            (out_dir / 'policy_rules.txt').write_text(rules)
+            (self.output_dir / 'decision_rules.txt').write_text(rules)
+            (out_dir / 'feature_importances.json').write_text(json.dumps(importances, indent=2))
+            (self.output_dir / 'feature_importances.json').write_text(json.dumps(importances, indent=2))
+        metrics_payload = {
+            'policy': agent_name,
+            'fidelity': fidelity,
+            'tree_depth': tree_depth,
+            'leaf_count': int(tree.get_n_leaves()),
+            'n_samples': int(len(states)),
+            'class_bins': [float(q1), float(q2)],
+        }
+        (out_dir / 'distillation_metrics.json').write_text(json.dumps(metrics_payload, indent=2))
+
+        # Counterfactual examples from nearest valid state with different predicted action.
+        cf_examples = []
+        for i in range(min(len(states), 200)):
+            s0 = states[i]
+            a0 = int(y[i])
+            l1 = np.abs(states - s0).sum(axis=1)
+            candidate_idx = np.where(y != a0)[0]
+            if len(candidate_idx) == 0:
+                continue
+            j = int(candidate_idx[np.argmin(l1[candidate_idx])])
+            s1 = states[j]
+            a1 = int(y[j])
+            deltas = s1 - s0
+            nz = np.where(np.abs(deltas) > 1e-4)[0]
+            if len(nz) == 0:
+                continue
+            top = nz[np.argsort(np.abs(deltas[nz]))[::-1][:3]]
+            changed = {
+                (feature_names[k] if k < len(feature_names) else f'feature_{k}'): float(deltas[k])
+                for k in top
+            }
+            explanation = f"Action bin changed from {a0} to {a1} after minimal state shift in top features."
+            cf_examples.append({
+                'original_state_summary': {feature_names[k] if k < len(feature_names) else f'feature_{k}': float(s0[k]) for k in top},
+                'original_action': a0,
+                'minimally_changed_features': changed,
+                'new_action': a1,
+                'explanation_text': explanation,
+            })
+            if len(cf_examples) >= max(10, int(getattr(self.config, 'n_counterfactuals', 10))):
+                break
+
+        cf_path = self.output_dir / 'counterfactuals.json'
+        if len(cf_examples) >= 10:
+            cf_path.write_text(json.dumps(cf_examples, indent=2))
+        else:
+            warning = (
+                "# INTERPRETABILITY_WARNING\n"
+                f"- Could not generate >=10 valid counterfactuals (generated {len(cf_examples)}).\n"
+                "- Counterfactual artifact omitted to avoid placeholder output.\n"
+            )
+            (self.output_dir / 'INTERPRETABILITY_WARNING.md').write_text(warning)
+            if cf_path.exists():
+                cf_path.unlink()
+
+        if fidelity < 0.6:
+            (self.output_dir / 'INTERPRETABILITY_WARNING.md').write_text(
+                "# INTERPRETABILITY_WARNING\n"
+                f"- Distillation fidelity below threshold: {fidelity:.4f} < 0.60.\n"
+                "- Interpretability claims should be treated as unreliable.\n"
+            )
+
+        self.results['policy_distillation'] = {
+            'fidelity': fidelity,
+            'rules_path': str(out_dir / 'policy_rules.txt') if (out_dir / 'policy_rules.txt').exists() else None,
+            'feature_importances_path': str(out_dir / 'feature_importances.json') if (out_dir / 'feature_importances.json').exists() else None,
+            'tree_depth': int(tree.get_depth()),
+            'leaf_count': int(tree.get_n_leaves()),
+            'counterfactuals_path': str(cf_path) if cf_path.exists() else None,
+        }
+        logger.info(f"Policy distillation complete ({agent_name}). fidelity={fidelity:.4f}")
 
     # ------------------------------------------------------------------
     # Stage 6
@@ -1351,23 +1559,27 @@ class IntegratedSolutionRunner:
         logger.info("=" * 80)
 
         summary_path = self.output_dir / 'results_summary.json'
-
         summary = {
             'timestamp': datetime.now().isoformat(),
             'mode': self.config.mode,
             'data_source': self.results.get('data', {}).get('source', 'unknown'),
-            'baselines_evaluated': list(
-                self.results.get('baselines', {}).get('policies', {}).keys()
-            ),
+            'baselines_evaluated': list(self.results.get('baselines', {}).get('policies', {}).keys()),
             'output_directory': str(self.output_dir),
+            'dataset_identity': {
+                'data_source': self.results.get('data', {}).get('source', 'unknown'),
+                'n_patients': len(self.results.get('data', {}).get('patients', self.results.get('data', {}).get('cohort', []))),
+                'n_trajectories': len(self.results.get('data', {}).get('train', [])) + len(self.results.get('data', {}).get('val', [])) + len(self.results.get('data', {}).get('test', [])),
+                'state_dimension': self._get_state_dim(),
+                'action_dimension': 1,
+                'reward_definition': 'in_range - 2*hypoglycemia - hyperglycemia + 0.5*medication_taken',
+                'seed': int(getattr(self.config, 'seed', 42)),
+                'git_commit': self._get_git_commit(),
+            },
         }
 
         if 'evaluation' in self.results:
             summary['evaluation'] = {
-                'safety_metrics': {
-                    name: (res.get('safety_index') if isinstance(res, dict) and 'safety_index' in res else res)
-                    for name, res in self.results['evaluation']['safety'].items()
-                },
+                'safety_metrics': self.results['evaluation'].get('safety', {}),
                 'clinical_metrics': {
                     name: res['guideline_compliance'] if res else None
                     for name, res in self.results['evaluation']['clinical'].items()
@@ -1397,13 +1609,18 @@ class IntegratedSolutionRunner:
                 'adapter_path': self.results['transfer'].get('adapter_path'),
             }
 
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=2)
+        self._write_json_with_provenance(summary_path, summary)
 
         logger.info(f"Results summary saved to {summary_path}")
 
         self._generate_latex_table()
-        self._generate_visualizations()
+        self._generate_master_results()
+        self._write_limitations_file()
+        if not getattr(self.config, 'demo', False) and not getattr(self.config, 'defense_bundle', False):
+            self._generate_visualizations()
+        else:
+            logger.info("Visualization generation skipped in demo/defense-bundle mode.")
+        self._run_artifact_validation()
 
         logger.info("Report generation complete")
 
@@ -1573,6 +1790,221 @@ class IntegratedSolutionRunner:
             'counterfactuals_path': str(cf_path),
         }
 
+    def _action_bounds_for_policy(self, policy) -> Tuple[np.ndarray, np.ndarray]:
+        if hasattr(policy, 'get_action_bounds'):
+            low, high = policy.get_action_bounds()
+            return np.asarray(low, dtype=np.float32).reshape(-1), np.asarray(high, dtype=np.float32).reshape(-1)
+        if hasattr(policy, 'config') and hasattr(policy.config, 'n_actions'):
+            return np.array([0.0], dtype=np.float32), np.array([float(max(0, policy.config.n_actions - 1))], dtype=np.float32)
+        return np.array([0.0], dtype=np.float32), np.array([1.0], dtype=np.float32)
+
+    def _safe_policy_action(self, policy, state: np.ndarray) -> Tuple[float, float]:
+        raw_action = policy.select_action(state, deterministic=True)
+        raw_scalar = float(np.asarray(raw_action, dtype=np.float32).reshape(-1)[0])
+        low, high = self._action_bounds_for_policy(policy)
+        clipped = float(np.clip(raw_scalar, low[0], high[0]))
+        return raw_scalar, clipped
+
+    def _fit_linear_simulator(self, transitions: List[Tuple]) -> Dict[str, np.ndarray]:
+        if not transitions:
+            raise ValueError("Cannot fit simulator: transitions are empty.")
+        states = np.asarray([np.asarray(t[0], dtype=np.float32).reshape(-1) for t in transitions], dtype=np.float32)
+        actions = np.asarray([float(np.asarray(t[1]).reshape(-1)[0]) for t in transitions], dtype=np.float32).reshape(-1, 1)
+        next_states = np.asarray([np.asarray(t[3], dtype=np.float32).reshape(-1) for t in transitions], dtype=np.float32)
+        rewards = np.asarray([float(t[2]) for t in transitions], dtype=np.float32).reshape(-1, 1)
+
+        x = np.concatenate([states, actions, np.ones((len(states), 1), dtype=np.float32)], axis=1)
+        l2 = 1e-2
+        reg = l2 * np.eye(x.shape[1], dtype=np.float32)
+        xtx_inv = np.linalg.inv(x.T @ x + reg)
+        w_next = xtx_inv @ x.T @ next_states
+        w_reward = xtx_inv @ x.T @ rewards
+        return {'w_next': w_next, 'w_reward': w_reward}
+
+    def _simulate_step_with_model(self, state: np.ndarray, action: float, model: Dict[str, np.ndarray]) -> Tuple[np.ndarray, float]:
+        feat = np.concatenate([state.reshape(-1), np.array([action, 1.0], dtype=np.float32)], axis=0)
+        next_state = feat @ model['w_next']
+        reward = float((feat @ model['w_reward']).reshape(-1)[0])
+        return np.asarray(next_state, dtype=np.float32), reward
+
+    def _state_hash(self, state: np.ndarray) -> str:
+        rounded = np.asarray(state, dtype=np.float32).round(4)
+        return hashlib.md5(rounded.tobytes()).hexdigest()[:12]
+
+    def _run_policy_rollout_evaluation(
+        self,
+        policies: Dict[str, Any],
+        train_data: List[Tuple],
+        eval_data: List[Tuple],
+        export_prefix: str,
+    ) -> Dict[str, Any]:
+        """Evaluate each policy with independent model-based rollouts and export raw traces."""
+        sim_model = self._fit_linear_simulator(train_data)
+        episodes = self._transitions_to_episodes(eval_data)
+        safety_cfg = EvaluationConfig().safety
+        g_low, g_high = safety_cfg.safe_glucose_range
+        raw_rows = []
+        ep_rows = []
+        summary_rows = []
+        action_signatures: Dict[str, str] = {}
+
+        for policy_name, policy in policies.items():
+            per_policy_actions = []
+            episode_returns = []
+            episode_lengths = []
+            unsafe_count = 0
+            total_steps = 0
+
+            for ep_id, ep in enumerate(episodes):
+                if not ep['states']:
+                    continue
+                state = np.asarray(ep['states'][0], dtype=np.float32).reshape(-1)
+                ep_return = 0.0
+
+                for step_id in range(len(ep['states'])):
+                    raw_action, clipped_action = self._safe_policy_action(policy, state)
+                    next_state, reward = self._simulate_step_with_model(state, clipped_action, sim_model)
+                    glucose = float(next_state[0]) if len(next_state) > 0 else 0.0
+                    unsafe = bool(glucose < g_low or glucose > g_high)
+                    done = step_id == (len(ep['states']) - 1)
+                    constraint_satisfied = not unsafe
+                    unsafe_count += int(unsafe)
+                    total_steps += 1
+                    per_policy_actions.append(clipped_action)
+                    ep_return += reward
+
+                    raw_rows.append({
+                        'policy_name': policy_name,
+                        'episode_id': ep_id,
+                        'step_id': step_id,
+                        'state_hash': self._state_hash(state),
+                        'action': raw_action,
+                        'clipped_action': clipped_action,
+                        'reward': reward,
+                        'done': done,
+                        'unsafe_flag': unsafe,
+                        'constraint_satisfied_flag': constraint_satisfied,
+                        'data_source': self.results.get('data', {}).get('source', 'unknown'),
+                        'seed': int(getattr(self.config, 'seed', 42)),
+                        'git_commit': self._get_git_commit(),
+                    })
+                    state = next_state
+
+                episode_returns.append(ep_return)
+                episode_lengths.append(len(ep['states']))
+                ep_rows.append({
+                    'policy_name': policy_name,
+                    'episode_id': ep_id,
+                    'episode_return': ep_return,
+                    'episode_length': len(ep['states']),
+                    'unsafe_steps': int(np.sum(
+                        [r['unsafe_flag'] for r in raw_rows if r['policy_name'] == policy_name and r['episode_id'] == ep_id]
+                    )),
+                    'data_source': self.results.get('data', {}).get('source', 'unknown'),
+                    'seed': int(getattr(self.config, 'seed', 42)),
+                    'git_commit': self._get_git_commit(),
+                })
+
+            if total_steps == 0:
+                raise RuntimeError(f"No rollout steps generated for policy {policy_name}.")
+
+            action_sig = hashlib.md5(np.asarray(per_policy_actions, dtype=np.float32).round(6).tobytes()).hexdigest()
+            action_signatures[policy_name] = action_sig
+            unsafe_action_rate = float(unsafe_count / total_steps)
+            summary_rows.append({
+                'policy': policy_name,
+                'mean_reward': float(np.mean(episode_returns)),
+                'std_reward': float(np.std(episode_returns)),
+                'median_reward': float(np.median(episode_returns)),
+                'mean_episode_length': float(np.mean(episode_lengths)),
+                'unsafe_action_rate': unsafe_action_rate,
+                'safety_violations_count': int(unsafe_count),
+                'constraint_satisfaction_rate': float(1.0 - unsafe_action_rate),
+                'safety_rate': float(1.0 - unsafe_action_rate),
+                'mean_action_value': float(np.mean(per_policy_actions)),
+                'std_action_value': float(np.std(per_policy_actions)),
+            })
+
+        sig_groups: Dict[str, List[str]] = {}
+        for p, sig in action_signatures.items():
+            sig_groups.setdefault(sig, []).append(p)
+        duplicates = [v for v in sig_groups.values() if len(v) > 1]
+        if duplicates and len(sig_groups) == 1:
+            raise RuntimeError(f"Identical policy action sequences detected: {duplicates}")
+
+        summary_df = pd.DataFrame(summary_rows).set_index('policy').sort_values('mean_reward', ascending=False)
+        if len(summary_df) > 1:
+            cols = ['mean_reward', 'std_reward', 'median_reward', 'unsafe_action_rate', 'mean_action_value']
+            n_unique = summary_df[cols].drop_duplicates().shape[0]
+            if n_unique == 1:
+                raise RuntimeError("All policies produced identical rollout summaries; evaluation likely degenerate.")
+
+        raw_df = pd.DataFrame(raw_rows)
+        ep_df = pd.DataFrame(ep_rows)
+        raw_eval_path = self.output_dir / f'{export_prefix}_policy_raw_evaluation.csv'
+        episode_summary_path = self.output_dir / f'{export_prefix}_policy_episode_summary.csv'
+        raw_df.to_csv(raw_eval_path, index=False)
+        ep_df.to_csv(episode_summary_path, index=False)
+        return {
+            'summary_df': summary_df,
+            'raw_eval_df': raw_df,
+            'episode_summary_df': ep_df,
+            'raw_eval_path': str(raw_eval_path),
+            'episode_summary_path': str(episode_summary_path),
+        }
+
+    def _export_baseline_reports(self, summary_df: pd.DataFrame) -> None:
+        required_cols = [
+            'mean_reward', 'std_reward', 'median_reward', 'mean_episode_length',
+            'unsafe_action_rate', 'constraint_satisfaction_rate',
+            'mean_action_value', 'std_action_value',
+        ]
+        for col in required_cols:
+            if col not in summary_df.columns:
+                raise RuntimeError(f"Baseline summary missing required column: {col}")
+
+        mean_rewards = summary_df['mean_reward'].to_numpy(dtype=np.float64)
+        if len(np.unique(mean_rewards)) == 1 and len(mean_rewards) > 1:
+            raise RuntimeError("All policies have identical mean_reward to full precision; stopping export.")
+
+        md_path = self.output_dir / 'baseline_comparison_report.md'
+        json_path = self.output_dir / 'baseline_comparison_report.json'
+        tex_path = self.output_dir / 'results_table.tex'
+
+        summary_reset = summary_df.reset_index()
+        md_lines = [
+            "# Baseline Comparison Report",
+            "",
+            f"- Generated: {datetime.now().isoformat()}",
+            f"- Data source: {self.results.get('data', {}).get('source', 'unknown')}",
+            "",
+            summary_reset.to_markdown(index=False),
+            "",
+        ]
+        md_path.write_text("\n".join(md_lines))
+        self._write_json_with_provenance(
+            json_path,
+            {'baseline_metrics': summary_reset.to_dict(orient='records')},
+        )
+
+        lines = [
+            "\\begin{table}[h]",
+            "\\centering",
+            "\\caption{Baseline Policy Comparison Results}",
+            "\\label{tab:baseline_comparison}",
+            "\\begin{tabular}{lcccc}",
+            "\\hline",
+            "Policy & Mean Reward & Std Reward & Unsafe Rate & Constraint Sat. \\\\",
+            "\\hline",
+        ]
+        for row in summary_reset.to_dict(orient='records'):
+            lines.append(
+                f"{row['policy']} & {row['mean_reward']:.4f} & {row['std_reward']:.4f} & "
+                f"{row['unsafe_action_rate']:.4f} & {row['constraint_satisfaction_rate']:.4f} \\\\"
+            )
+        lines.extend(["\\hline", "\\end{tabular}", "\\end{table}"])
+        tex_path.write_text("\n".join(lines) + "\n")
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1635,6 +2067,156 @@ class IntegratedSolutionRunner:
             trajs.append(current)
         return trajs
 
+    def _generate_master_results(self) -> None:
+        if 'evaluation' not in self.results:
+            return
+        rollout_df = self.results['evaluation'].get('rollout_summary')
+        if rollout_df is None or rollout_df.empty:
+            return
+
+        master = rollout_df.reset_index().rename(columns={'index': 'policy'})
+        ope_df = self.results['evaluation'].get('ope_table')
+        wis_map, dr_map, ess_map = {}, {}, {}
+        if isinstance(ope_df, pd.DataFrame) and not ope_df.empty:
+            for _, row in ope_df.iterrows():
+                p = row['policy']
+                est = str(row['estimator']).upper()
+                if est == 'WIS':
+                    wis_map[p] = float(row['value_estimate'])
+                    ess_map[p] = float(row['ess'])
+                if est == 'DR':
+                    dr_map[p] = float(row['value_estimate'])
+                    ess_map[p] = float(row['ess'])
+
+        master['WIS'] = master['policy'].map(wis_map)
+        master['DR'] = master['policy'].map(dr_map)
+        master['ESS'] = master['policy'].map(ess_map)
+        if len(master) > 1:
+            master['subgroup_gap'] = float(master['mean_reward'].max() - master['mean_reward'].min())
+        else:
+            master['subgroup_gap'] = 0.0
+        fidelity = self.results.get('policy_distillation', {}).get('fidelity')
+        master['interpretability_fidelity'] = float(fidelity) if fidelity is not None else np.nan
+
+        keep_cols = [
+            'policy', 'mean_reward', 'std_reward', 'mean_episode_length',
+            'unsafe_action_rate', 'constraint_satisfaction_rate',
+            'WIS', 'DR', 'ESS', 'subgroup_gap', 'interpretability_fidelity',
+        ]
+        master = master[keep_cols]
+        for c in ['data_source', 'seed', 'git_commit']:
+            if c == 'data_source':
+                master[c] = self.results.get('data', {}).get('source', 'unknown')
+            elif c == 'seed':
+                master[c] = int(getattr(self.config, 'seed', 42))
+            else:
+                master[c] = self._get_git_commit()
+        master_path = self.output_dir / 'MASTER_RESULTS.csv'
+        master.to_csv(master_path, index=False)
+
+        md_lines = [
+            "# MASTER RESULTS",
+            "",
+            f"- Generated: {datetime.now().isoformat()}",
+            f"- Data source: {self.results.get('data', {}).get('source', 'unknown')}",
+            "",
+            master.to_markdown(index=False),
+            "",
+        ]
+        (self.output_dir / 'MASTER_RESULTS.md').write_text("\n".join(md_lines))
+        self.results['master_results'] = master
+
+    def _write_limitations_file(self) -> None:
+        lines = [
+            "# LIMITATIONS",
+            "",
+            "## Synthetic vs Real Data",
+            "- Synthetic trajectories simplify clinical dynamics and may not capture all real-world confounders.",
+            "- MIMIC-derived trajectories are retrospective and reflect logged clinician behavior, not prospective interventions.",
+            "",
+            "## Support Mismatch",
+            "- OPE estimates are sensitive to limited overlap between target policy actions and behavior policy support.",
+            "- Low ESS or heavy clipping indicates unstable estimates and limited reliability.",
+            "",
+            "## Offline RL Constraints",
+            "- No online interaction or prospective validation was performed.",
+            "- Policy quality is bounded by logging policy quality and dataset coverage.",
+            "",
+            "## Non-Deployment Disclaimer",
+            "- This artifact is for retrospective research and thesis defense only.",
+            "- Outputs must not be used for live clinical decision support.",
+            "",
+        ]
+        (self.output_dir / 'LIMITATIONS.md').write_text("\n".join(lines))
+
+    def _run_artifact_validation(self) -> None:
+        failures = []
+        rules_path = self.output_dir / 'decision_rules.txt'
+        if rules_path.exists() and rules_path.read_text().strip() == "|--- class: 0":
+            failures.append("Placeholder decision rules detected in decision_rules.txt.")
+
+        fi_path = self.output_dir / 'feature_importances.json'
+        if fi_path.exists():
+            try:
+                fi = json.loads(fi_path.read_text())
+                if fi and all(abs(float(v)) <= 1e-12 for v in fi.values()):
+                    failures.append("All feature importances are zero.")
+            except Exception:
+                failures.append("Failed to parse feature_importances.json.")
+
+        cf_path = self.output_dir / 'counterfactuals.json'
+        if cf_path.exists():
+            try:
+                cfs = json.loads(cf_path.read_text())
+                if not cfs:
+                    failures.append("counterfactuals.json is empty.")
+            except Exception:
+                failures.append("Failed to parse counterfactuals.json.")
+
+        baseline_json = self.output_dir / 'baseline_comparison_report.json'
+        if baseline_json.exists():
+            payload = json.loads(baseline_json.read_text())
+            rows = payload.get('baseline_metrics', [])
+            mean_rewards = [float(r['mean_reward']) for r in rows if 'mean_reward' in r]
+            if len(mean_rewards) > 1 and len(set(mean_rewards)) == 1:
+                failures.append("Identical mean rewards across distinct baseline policies.")
+
+        safety_csv = self.output_dir / 'safety_summary.csv'
+        if safety_csv.exists() and 'evaluation' in self.results:
+            sdf = pd.read_csv(safety_csv)
+            for _, row in sdf.iterrows():
+                p = row['policy']
+                eval_s = self.results['evaluation']['safety'].get(p, {})
+                expected = float(eval_s.get('constraint_satisfaction_rate', np.nan))
+                observed = float(row['constraint_satisfaction_rate'])
+                if np.isfinite(expected) and abs(expected - observed) > 1e-9:
+                    failures.append(f"Contradictory safety values for policy {p}.")
+
+        source = self.results.get('data', {}).get('source', 'unknown')
+        if source == 'synthetic' and 'mimic' in self.output_dir.name.lower():
+            failures.append("Output directory label implies MIMIC while data_source is synthetic.")
+
+        master_path = self.output_dir / 'MASTER_RESULTS.csv'
+        if master_path.exists():
+            master = pd.read_csv(master_path)
+            expected_policies = set(self.results.get('evaluation', {}).get('rollout_summary', pd.DataFrame()).index.tolist())
+            if not expected_policies.issubset(set(master['policy'].tolist())):
+                failures.append("MASTER_RESULTS.csv missing required policy rows.")
+
+        if failures:
+            out = ["# VALIDATION FAILURES", ""]
+            for idx, f in enumerate(failures, 1):
+                out.append(f"{idx}. {f}")
+            out.extend([
+                "",
+                "Likely root causes:",
+                "- policy-specific rollout path not used consistently across exporters",
+                "- placeholder interpretability files persisted from fallback code paths",
+                "- metadata/data-source labels not propagated uniformly",
+            ])
+            (self.output_dir / 'VALIDATION_FAILURES.md').write_text("\n".join(out) + "\n")
+            raise RuntimeError(f"Artifact validation failed with {len(failures)} issue(s).")
+
     def _generate_latex_table(self):
         if 'baselines' not in self.results:
             return
@@ -1655,11 +2237,11 @@ class IntegratedSolutionRunner:
 
         for policy_name, row in comparison.iterrows():
             mean_reward = row.get('mean_reward', float('nan'))
-            safety_rate = row.get('safety_rate', float('nan'))
-            total_steps = row.get('total_steps', 0)
+            safety_rate = row.get('constraint_satisfaction_rate', row.get('safety_rate', float('nan')))
+            mean_len = row.get('mean_episode_length', row.get('total_steps', 0))
             lines.append(
                 f"{policy_name} & {mean_reward:.4f} & "
-                f"{safety_rate:.2%} & {int(total_steps)} \\\\"
+                f"{safety_rate:.2%} & {int(mean_len)} \\\\"
             )
 
         lines += ["\\hline", "\\end{tabular}", "\\end{table}"]
