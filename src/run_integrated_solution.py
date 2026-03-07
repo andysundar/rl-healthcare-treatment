@@ -807,6 +807,7 @@ class IntegratedSolutionRunner:
             logger.info("No data yet — generating synthetic data for encoder training...")
             data = self.prepare_synthetic_data()
             self.results['data'] = data
+            self._normalize_output_dir_by_data_source()
         else:
             data = self.results['data']
 
