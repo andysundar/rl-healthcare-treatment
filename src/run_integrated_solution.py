@@ -32,6 +32,7 @@ import torch
 
 os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
 os.environ.setdefault('XDG_CACHE_HOME', '/tmp')
+os.environ.setdefault('MPLBACKEND', 'Agg')
 import matplotlib.pyplot as plt
 
 # --- path setup MUST come before any local imports ---
@@ -1360,10 +1361,24 @@ class IntegratedSolutionRunner:
         cql_agent = self.results.get('cql', {}).get('agent')
         if cql_agent is not None and hasattr(cql_agent, 'q_network1'):
             logger.info("Using trained CQL critic as DR q_function")
+            expected_state_dim = int(getattr(cql_agent, 'state_dim', 0)) if hasattr(cql_agent, 'state_dim') else 0
+            encoder_wrapper = self.results.get('encoder_wrapper')
 
             def _cql_q_fn(state, action):
                 with torch.no_grad():
-                    s = np.asarray(state, dtype=np.float32).reshape(1, -1)
+                    s_raw = np.asarray(state, dtype=np.float32).reshape(-1)
+                    if expected_state_dim and s_raw.shape[0] != expected_state_dim and encoder_wrapper is not None:
+                        try:
+                            s_raw = np.asarray(encoder_wrapper.encode_state(s_raw), dtype=np.float32).reshape(-1)
+                        except Exception:
+                            pass
+                    if expected_state_dim and s_raw.shape[0] != expected_state_dim:
+                        if s_raw.shape[0] < expected_state_dim:
+                            s_raw = np.pad(s_raw, (0, expected_state_dim - s_raw.shape[0]), mode='constant')
+                        else:
+                            s_raw = s_raw[:expected_state_dim]
+
+                    s = s_raw.reshape(1, -1)
                     a = np.asarray(action, dtype=np.float32).reshape(1, -1)
                     s_t = torch.tensor(s, dtype=torch.float32, device=cql_agent.device)
                     a_t = torch.tensor(a, dtype=torch.float32, device=cql_agent.device)
@@ -1426,6 +1441,7 @@ class IntegratedSolutionRunner:
         data = self.results['data']
         agent = None
         agent_name = None
+        encoder_wrapper = self.results.get('encoder_wrapper')
         if self.results.get('cql', {}).get('agent') is not None:
             agent = self.results['cql']['agent']
             agent_name = 'CQL'
@@ -1440,7 +1456,13 @@ class IntegratedSolutionRunner:
             return
         raw_actions = []
         for s in states:
-            a = agent.select_action(s, deterministic=True)
+            s_for_policy = s
+            if agent_name == 'CQL' and encoder_wrapper is not None:
+                try:
+                    s_for_policy = np.asarray(encoder_wrapper.encode_state(s), dtype=np.float32).reshape(-1)
+                except Exception:
+                    s_for_policy = s
+            a = agent.select_action(s_for_policy, deterministic=True)
             raw_actions.append(float(np.asarray(a).reshape(-1)[0]))
         raw_actions = np.asarray(raw_actions, dtype=np.float32)
         q1, q2 = np.quantile(raw_actions, [0.33, 0.67])
