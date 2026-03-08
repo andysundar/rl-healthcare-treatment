@@ -235,6 +235,53 @@ class IntegratedSolutionRunner:
         if self._is_strict_mimic_run() and source != 'mimic':
             raise RuntimeError(f"Strict provenance violation: expected MIMIC data, got '{source}'.")
 
+    def _checkpoint_root(self) -> Path:
+        explicit = getattr(self.config, 'checkpoint_dir', None)
+        root = Path(explicit) if explicit else (self.output_dir / 'checkpoints' / 'mimic')
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _checkpoint_path(self, name: str, suffix: str) -> Path:
+        return self._checkpoint_root() / f"{name}.{suffix.lstrip('.')}"
+
+    def _checkpoint_exists(self, name: str, suffix: str) -> bool:
+        return self._checkpoint_path(name, suffix).exists()
+
+    def _should_load_checkpoint(self, name: str, suffix: str) -> bool:
+        if getattr(self.config, 'ignore_checkpoints', False):
+            return False
+        if not getattr(self.config, 'resume', False):
+            return False
+        return self._checkpoint_exists(name, suffix)
+
+    def _save_pickle_checkpoint(self, name: str, obj: Any) -> Path:
+        path = self._checkpoint_path(name, 'pkl')
+        import pickle
+        with open(path, 'wb') as f:
+            pickle.dump(obj, f)
+        logger.info("Saved checkpoint: %s", path)
+        return path
+
+    def _load_pickle_checkpoint(self, name: str) -> Any:
+        path = self._checkpoint_path(name, 'pkl')
+        import pickle
+        with open(path, 'rb') as f:
+            obj = pickle.load(f)
+        logger.info("Loaded checkpoint: %s", path)
+        return obj
+
+    def _save_parquet_checkpoint(self, name: str, df: pd.DataFrame) -> Path:
+        path = self._checkpoint_path(name, 'parquet')
+        df.to_parquet(path, index=False)
+        logger.info("Saved checkpoint: %s (rows=%s)", path, len(df))
+        return path
+
+    def _load_parquet_checkpoint(self, name: str) -> pd.DataFrame:
+        path = self._checkpoint_path(name, 'parquet')
+        df = pd.read_parquet(path)
+        logger.info("Loaded checkpoint: %s (rows=%s)", path, len(df))
+        return df
+
     def _get_git_commit(self) -> str:
         """Return current git commit hash, if available."""
         try:
@@ -638,179 +685,128 @@ class IntegratedSolutionRunner:
         return data
 
     def prepare_mimic_data(self):
-        """Prepare MIMIC-III data as RL trajectory tuples (same format as synthetic)."""
+        """Prepare MIMIC-III data with resumable cohort + batch checkpoints."""
         logger.info("Loading MIMIC-III data...")
+        logger.info(
+            "Checkpoint settings: resume=%s ignore_checkpoints=%s checkpoint_dir=%s",
+            bool(getattr(self.config, 'resume', False)),
+            bool(getattr(self.config, 'ignore_checkpoints', False)),
+            str(self._checkpoint_root()),
+        )
 
-        from data import MIMICLoader, CohortBuilder, FeatureEngineer, DataPreprocessor
+        if self._should_load_checkpoint('prepared_mimic_data', 'pkl'):
+            payload = self._load_pickle_checkpoint('prepared_mimic_data')
+            logger.info("Using fully prepared MIMIC dataset from checkpoint.")
+            return payload
+
+        from data import MIMICLoader, CohortBuilder, FeatureEngineer
 
         mimic_dir = Path(self.config.mimic_dir)
         if not mimic_dir.exists():
             raise FileNotFoundError(f"MIMIC directory not found: {mimic_dir}")
         loader = MIMICLoader(data_dir=str(mimic_dir), use_cache=True)
 
-        patients    = loader.load_patients()
-        admissions  = loader.load_admissions()
-        diagnoses   = loader.load_diagnoses_icd()
+        patients = loader.load_patients()
+        admissions = loader.load_admissions()
+        diagnoses = loader.load_diagnoses_icd()
         logger.info(f"Loaded {len(patients):,} patients")
 
-        builder          = CohortBuilder(patients, admissions, diagnoses)
-        diabetes_pts     = builder.define_diabetes_cohort()
-        filtered_pts     = builder.apply_inclusion_criteria(
-            diabetes_pts, min_age=18, max_age=80, min_admissions=2
-        )
-        final_cohort     = builder.apply_exclusion_criteria(
-            filtered_pts, exclude_pregnancy=True, exclude_pediatric=True
-        )
-        logger.info(f"Final cohort: {len(final_cohort):,} patients")
+        builder = CohortBuilder(patients, admissions, diagnoses)
+
+        if self._should_load_checkpoint('01_diabetes_patients', 'pkl'):
+            diabetes_pts = self._load_pickle_checkpoint('01_diabetes_patients')
+        else:
+            diabetes_pts = builder.define_diabetes_cohort()
+            self._save_pickle_checkpoint('01_diabetes_patients', diabetes_pts)
+
+        if self._should_load_checkpoint('02_inclusion_filtered_patients', 'pkl'):
+            filtered_pts = self._load_pickle_checkpoint('02_inclusion_filtered_patients')
+        else:
+            filtered_pts = builder.apply_inclusion_criteria(
+                diabetes_pts, min_age=18, max_age=80, min_admissions=2
+            )
+            self._save_pickle_checkpoint('02_inclusion_filtered_patients', filtered_pts)
+
+        if self._should_load_checkpoint('03_final_cohort_patients', 'pkl'):
+            final_cohort = self._load_pickle_checkpoint('03_final_cohort_patients')
+        else:
+            final_cohort = builder.apply_exclusion_criteria(
+                filtered_pts, exclude_pregnancy=True, exclude_pediatric=True
+            )
+            self._save_pickle_checkpoint('03_final_cohort_patients', final_cohort)
+
+        final_cohort = sorted(set(int(x) for x in final_cohort))
+        logger.info(f"Final cohort before sampling: {len(final_cohort):,} patients")
 
         if self.config.use_sample:
             import random
-            random.seed(42)
-            final_cohort = random.sample(
+            random.seed(int(getattr(self.config, 'seed', 42)))
+            final_cohort = sorted(random.sample(
                 final_cohort, min(self.config.sample_size, len(final_cohort))
-            )
+            ))
             logger.info(f"Using sample of {len(final_cohort)} patients")
 
-        labs          = loader.load_lab_events(subject_ids=final_cohort)
-        prescriptions = loader.load_prescriptions(subject_ids=final_cohort)
+        if not final_cohort:
+            raise RuntimeError("Final MIMIC cohort is empty after inclusion/exclusion criteria.")
 
-        # --- Vital signs (opt-in via --use-vitals) ---
-        vitals_df = None
-        if getattr(self.config, 'use_vitals', False):
-            logger.info("Loading CHARTEVENTS for vital signs...")
-            all_vital_ids = [
-                211, 220045,                         # heart_rate
-                51, 442, 455, 6701, 220050, 220179,  # sbp
-                618, 615, 220210, 224690,             # respiratory_rate
-                646, 220277,                          # spo2
-            ]
-            chartevents = loader.load_chartevents(
-                subject_ids=final_cohort, item_ids=all_vital_ids,
-            )
-            if len(chartevents) > 0:
-                vitals_df = FeatureEngineer().extract_vitals_sequence(
-                    chartevents, subject_ids=final_cohort
-                )
-                logger.info(f"Extracted vitals: {len(vitals_df):,} timepoints")
-
-        engineer     = FeatureEngineer()
-        demographics = engineer.extract_demographics(patients, admissions)
-        demographics = demographics[demographics['subject_id'].isin(final_cohort)]
-
-        if len(labs) == 0:
-            raise ValueError(
-                "No lab events found for cohort. "
-                "Verify --mimic-dir points to the MIMIC-III CSV directory."
-            )
-
-        lab_sequence = engineer.extract_lab_sequence(labs, final_cohort)
-        if len(lab_sequence) == 0:
-            raise ValueError("Lab sequence extraction produced no rows.")
-
-        # Deduplicate before computing per-row indices
-        lab_sequence = (
-            lab_sequence
-            .drop_duplicates(subset=['subject_id', 'hadm_id', 'charttime'])
-            .sort_values(['subject_id', 'hadm_id', 'charttime'])
-            .reset_index(drop=True)
-        )
-
-        # --- Clinical flags from RAW glucose (before any normalization) ---
-        clin_flags = lab_sequence[['subject_id', 'hadm_id', 'charttime']].copy()
-        if 'glucose' in lab_sequence.columns:
-            clin_flags['hypoglycemia']  = (lab_sequence['glucose'] < 70.0).astype(float)
-            clin_flags['hyperglycemia'] = (lab_sequence['glucose'] > 180.0).astype(float)
+        if self._should_load_checkpoint('04_demographics', 'parquet'):
+            demographics = self._load_parquet_checkpoint('04_demographics')
         else:
-            clin_flags['hypoglycemia']  = 0.0
-            clin_flags['hyperglycemia'] = 0.0
+            engineer = FeatureEngineer()
+            demographics = engineer.extract_demographics(patients, admissions)
+            demographics = demographics[demographics['subject_id'].isin(final_cohort)]
+            self._save_parquet_checkpoint('04_demographics', demographics)
 
-        # --- Day index per admission (0-indexed step within each hadm_id) ---
-        day_idx = lab_sequence[['subject_id', 'hadm_id', 'charttime']].copy()
-        day_idx['day_raw'] = (
-            lab_sequence.groupby(['subject_id', 'hadm_id']).cumcount().astype(float)
-        )
+        batch_size = int(getattr(self.config, 'batch_size', 512))
+        if batch_size <= 0:
+            raise ValueError("--batch-size must be > 0")
 
-        # --- Insulin features from prescriptions ---
-        insulin_daily = self._extract_insulin_daily(prescriptions, set(final_cohort))
+        n_batches = int(np.ceil(len(final_cohort) / batch_size))
+        logger.info(
+            "Preparing MIMIC feature batches: %s patients in %s batches (batch_size=%s).",
+            len(final_cohort),
+            n_batches,
+            batch_size,
+        )
+        batch_names: List[str] = []
+        non_empty_batch_names: List[str] = []
+        for batch_idx in range(n_batches):
+            start = batch_idx * batch_size
+            stop = min(len(final_cohort), (batch_idx + 1) * batch_size)
+            batch_subject_ids = final_cohort[start:stop]
+            batch_name = f"05_features_batch_{batch_idx:04d}"
+            batch_names.append(batch_name)
 
-        # --- Standard preprocessing pipeline (only on lab values) ---
-        temporal_features = engineer.create_temporal_features(
-            lab_sequence, time_column='charttime'
-        )
-        preprocessor   = DataPreprocessor()
-        clean_data     = preprocessor.clean_missing_values(temporal_features)
-        clean_data     = preprocessor.handle_outliers(clean_data)
-        normalized_data = preprocessor.normalize_labs(clean_data)
+            if self._should_load_checkpoint(batch_name, 'parquet'):
+                batch_df = self._load_parquet_checkpoint(batch_name)
+                logger.info(
+                    "Batch %s/%s loaded from checkpoint (%s patients, %s rows).",
+                    batch_idx + 1, n_batches, len(batch_subject_ids), len(batch_df),
+                )
+                if len(batch_df) > 0:
+                    non_empty_batch_names.append(batch_name)
+                continue
 
-        # --- Join supplementary features (outside normalizer to protect binary cols) ---
-        # Clinical flags
-        normalized_data = normalized_data.merge(
-            clin_flags, on=['subject_id', 'hadm_id', 'charttime'], how='left'
-        )
-        # Day index → normalize to [0, 1] within each admission
-        normalized_data = normalized_data.merge(
-            day_idx, on=['subject_id', 'hadm_id', 'charttime'], how='left'
-        )
-        max_days = (
-            normalized_data.groupby(['subject_id', 'hadm_id'])['day_raw']
-            .transform('max').replace(0, 1)
-        )
-        normalized_data['day'] = (normalized_data['day_raw'] / max_days).fillna(0.0)
-
-        # Insulin (join by subject_id + date)
-        normalized_data['_jdate'] = pd.to_datetime(
-            normalized_data['charttime'], errors='coerce'
-        ).dt.date
-        if len(insulin_daily) > 0:
-            normalized_data = normalized_data.merge(
-                insulin_daily.rename(columns={'_lab_date': '_jdate'}),
-                on=['subject_id', '_jdate'], how='left',
+            logger.info(
+                "Processing batch %s/%s (%s patients)...",
+                batch_idx + 1, n_batches, len(batch_subject_ids),
             )
-        for col in ['insulin_flag', 'insulin_dose']:
-            if col not in normalized_data.columns:
-                normalized_data[col] = 0.0
-            else:
-                normalized_data[col] = normalized_data[col].fillna(0.0)
-        normalized_data = normalized_data.drop(columns=['_jdate'], errors='ignore')
+            batch_df = self._prepare_mimic_feature_batch(
+                loader=loader,
+                subject_ids=batch_subject_ids,
+            )
+            self._save_parquet_checkpoint(batch_name, batch_df)
+            if len(batch_df) > 0:
+                non_empty_batch_names.append(batch_name)
 
-        # Vitals (daily aggregate → join by subject_id + hadm_id + date)
-        if getattr(self.config, 'use_vitals', False) and vitals_df is not None and len(vitals_df) > 0:
-            avail_vcols = [c for c in VITAL_COLS if c in vitals_df.columns]
-            if avail_vcols:
-                vdf        = vitals_df.copy()
-                vdf['_vd'] = pd.to_datetime(vdf['charttime'], errors='coerce').dt.date
-                vagg       = (
-                    vdf.groupby(['subject_id', 'hadm_id', '_vd'])[avail_vcols]
-                    .mean().reset_index().rename(columns={'_vd': '_jdate'})
-                )
-                normalized_data['_jdate'] = pd.to_datetime(
-                    normalized_data['charttime'], errors='coerce'
-                ).dt.date
-                normalized_data = normalized_data.merge(
-                    vagg, on=['subject_id', 'hadm_id', '_jdate'], how='left'
-                )
-                normalized_data = normalized_data.drop(columns=['_jdate'], errors='ignore')
-        for col in VITAL_COLS:
-            if col not in normalized_data.columns:
-                normalized_data[col] = 0.0
-            else:
-                normalized_data[col] = normalized_data[col].fillna(0.0)
+        if not non_empty_batch_names:
+            raise RuntimeError(
+                "All MIMIC feature batches are empty. Verify mimic-dir data integrity and cohort filters."
+            )
 
-        # Medication history
-        if getattr(self.config, 'use_med_history', False):
-            med_hist = self._compute_med_history_features(prescriptions, set(final_cohort))
-            normalized_data = normalized_data.merge(med_hist, on='subject_id', how='left')
-        for col in MED_HISTORY_COLS:
-            if col not in normalized_data.columns:
-                normalized_data[col] = 0.0
-            else:
-                normalized_data[col] = normalized_data[col].fillna(0.0)
-
-        # Clean up utility columns
-        normalized_data = normalized_data.drop(columns=['day_raw'], errors='ignore')
-
-        # --- Map MIMIC columns → BASE_STATE_COLS naming ---
-        normalized_data = self._build_mimic_state_columns(normalized_data)
+        logger.info("Assembling %s non-empty feature batches...", len(non_empty_batch_names))
+        batch_frames = [self._load_parquet_checkpoint(name) for name in non_empty_batch_names]
+        normalized_data = pd.concat(batch_frames, ignore_index=True)
 
         state_cols = self._get_state_cols()
         for col in state_cols:
@@ -818,15 +814,14 @@ class IntegratedSolutionRunner:
                 logger.warning("State column '%s' missing from MIMIC data, filling 0.", col)
                 normalized_data[col] = 0.0
 
-        # --- Patient-level train / val / test split ---
-        unique_pts = list(set(final_cohort))
-        rng        = np.random.default_rng(int(getattr(self.config, 'seed', 42)))
+        unique_pts = list(sorted(set(final_cohort)))
+        rng = np.random.default_rng(int(getattr(self.config, 'seed', 42)))
         rng.shuffle(unique_pts)
         n_train = int(0.70 * len(unique_pts))
-        n_val   = int(0.15 * len(unique_pts))
+        n_val = int(0.15 * len(unique_pts))
         train_pts = set(unique_pts[:n_train])
-        val_pts   = set(unique_pts[n_train:n_train + n_val])
-        test_pts  = set(unique_pts[n_train + n_val:])
+        val_pts = set(unique_pts[n_train:n_train + n_val])
+        test_pts = set(unique_pts[n_train + n_val:])
 
         train_data = self._build_mimic_trajectories(
             normalized_data[normalized_data['subject_id'].isin(train_pts)], state_cols
@@ -839,23 +834,28 @@ class IntegratedSolutionRunner:
         )
 
         data = {
-            'train':        train_data,
-            'val':          val_data,
-            'test':         test_data,
+            'train': train_data,
+            'val': val_data,
+            'test': test_data,
             'demographics': demographics,
-            'cohort':       final_cohort,
-            'source':       'mimic',
-            'state_cols':   state_cols,
+            'cohort': final_cohort,
+            'source': 'mimic',
+            'state_cols': state_cols,
             'input_dataset_path': str(mimic_dir.resolve()),
+            'batch_size': batch_size,
+            'n_feature_batches': n_batches,
         }
         if not train_data or not test_data:
             raise RuntimeError(
                 f"MIMIC trajectory build produced insufficient data (train={len(train_data)}, test={len(test_data)})."
             )
+
         import pickle
         mimic_path = self.output_dir / 'mimic_trajectories.pkl'
         with open(mimic_path, 'wb') as f:
             pickle.dump(data, f)
+        self._save_pickle_checkpoint('prepared_mimic_data', data)
+
         summary_path = self.output_dir / 'mimic_dataset_summary.json'
         summary_path.write_text(json.dumps({
             'input_dataset_path': str(mimic_dir.resolve()),
@@ -865,6 +865,10 @@ class IntegratedSolutionRunner:
             'n_test_trajectories': int(len(test_data)),
             'state_dim': int(len(state_cols)),
             'action_dim': 1,
+            'batch_size': batch_size,
+            'n_feature_batches': n_batches,
+            'resume_used': bool(getattr(self.config, 'resume', False)),
+            'ignore_checkpoints': bool(getattr(self.config, 'ignore_checkpoints', False)),
         }, indent=2))
         logger.info(
             f"MIMIC trajectories — Train: {len(train_data):,} | "
@@ -2751,6 +2755,140 @@ class IntegratedSolutionRunner:
     # MIMIC-III trajectory helpers
     # ------------------------------------------------------------------
 
+    def _prepare_mimic_feature_batch(
+        self,
+        loader,
+        subject_ids: List[int],
+    ) -> pd.DataFrame:
+        """Build normalized feature rows for a patient batch."""
+        from data import FeatureEngineer, DataPreprocessor
+
+        engineer = FeatureEngineer()
+        preprocessor = DataPreprocessor()
+        subj_set = set(int(s) for s in subject_ids)
+
+        labs = loader.load_lab_events(subject_ids=list(subj_set))
+        prescriptions = loader.load_prescriptions(subject_ids=list(subj_set))
+        if len(labs) == 0:
+            logger.warning("No lab events in current batch (patients=%s).", len(subject_ids))
+            return pd.DataFrame(columns=['subject_id', 'hadm_id', 'charttime'])
+
+        lab_sequence = engineer.extract_lab_sequence(labs, list(subj_set))
+        if len(lab_sequence) == 0:
+            logger.warning("Lab sequence extraction returned no rows for batch.")
+            return pd.DataFrame(columns=['subject_id', 'hadm_id', 'charttime'])
+
+        lab_sequence = (
+            lab_sequence
+            .drop_duplicates(subset=['subject_id', 'hadm_id', 'charttime'])
+            .sort_values(['subject_id', 'hadm_id', 'charttime'])
+            .reset_index(drop=True)
+        )
+
+        clin_flags = lab_sequence[['subject_id', 'hadm_id', 'charttime']].copy()
+        if 'glucose' in lab_sequence.columns:
+            clin_flags['hypoglycemia'] = (lab_sequence['glucose'] < 70.0).astype(float)
+            clin_flags['hyperglycemia'] = (lab_sequence['glucose'] > 180.0).astype(float)
+        else:
+            clin_flags['hypoglycemia'] = 0.0
+            clin_flags['hyperglycemia'] = 0.0
+
+        day_idx = lab_sequence[['subject_id', 'hadm_id', 'charttime']].copy()
+        day_idx['day_raw'] = (
+            lab_sequence.groupby(['subject_id', 'hadm_id']).cumcount().astype(float)
+        )
+        insulin_daily = self._extract_insulin_daily(prescriptions, subj_set)
+
+        temporal_features = engineer.create_temporal_features(
+            lab_sequence, time_column='charttime'
+        )
+        clean_data = preprocessor.clean_missing_values(temporal_features)
+        clean_data = preprocessor.handle_outliers(clean_data)
+        normalized_data = preprocessor.normalize_labs(clean_data)
+
+        normalized_data = normalized_data.merge(
+            clin_flags, on=['subject_id', 'hadm_id', 'charttime'], how='left'
+        )
+        normalized_data = normalized_data.merge(
+            day_idx, on=['subject_id', 'hadm_id', 'charttime'], how='left'
+        )
+        max_days = (
+            normalized_data.groupby(['subject_id', 'hadm_id'])['day_raw']
+            .transform('max').replace(0, 1)
+        )
+        normalized_data['day'] = (normalized_data['day_raw'] / max_days).fillna(0.0)
+
+        normalized_data['_jdate'] = pd.to_datetime(
+            normalized_data['charttime'], errors='coerce'
+        ).dt.date
+        if len(insulin_daily) > 0:
+            normalized_data = normalized_data.merge(
+                insulin_daily.rename(columns={'_lab_date': '_jdate'}),
+                on=['subject_id', '_jdate'], how='left',
+            )
+        for col in ['insulin_flag', 'insulin_dose']:
+            if col not in normalized_data.columns:
+                normalized_data[col] = 0.0
+            else:
+                normalized_data[col] = normalized_data[col].fillna(0.0)
+        normalized_data = normalized_data.drop(columns=['_jdate'], errors='ignore')
+
+        vitals_df = None
+        if getattr(self.config, 'use_vitals', False):
+            all_vital_ids = [
+                211, 220045,
+                51, 442, 455, 6701, 220050, 220179,
+                618, 615, 220210, 224690,
+                646, 220277,
+            ]
+            chartevents = loader.load_chartevents(
+                subject_ids=list(subj_set), item_ids=all_vital_ids,
+            )
+            if len(chartevents) > 0:
+                vitals_df = engineer.extract_vitals_sequence(
+                    chartevents, subject_ids=list(subj_set)
+                )
+        if getattr(self.config, 'use_vitals', False) and vitals_df is not None and len(vitals_df) > 0:
+            avail_vcols = [c for c in VITAL_COLS if c in vitals_df.columns]
+            if avail_vcols:
+                vdf = vitals_df.copy()
+                vdf['_vd'] = pd.to_datetime(vdf['charttime'], errors='coerce').dt.date
+                vagg = (
+                    vdf.groupby(['subject_id', 'hadm_id', '_vd'])[avail_vcols]
+                    .mean().reset_index().rename(columns={'_vd': '_jdate'})
+                )
+                normalized_data['_jdate'] = pd.to_datetime(
+                    normalized_data['charttime'], errors='coerce'
+                ).dt.date
+                normalized_data = normalized_data.merge(
+                    vagg, on=['subject_id', 'hadm_id', '_jdate'], how='left'
+                )
+                normalized_data = normalized_data.drop(columns=['_jdate'], errors='ignore')
+        for col in VITAL_COLS:
+            if col not in normalized_data.columns:
+                normalized_data[col] = 0.0
+            else:
+                normalized_data[col] = normalized_data[col].fillna(0.0)
+
+        if getattr(self.config, 'use_med_history', False):
+            med_hist = self._compute_med_history_features(prescriptions, subj_set)
+            normalized_data = normalized_data.merge(med_hist, on='subject_id', how='left')
+        for col in MED_HISTORY_COLS:
+            if col not in normalized_data.columns:
+                normalized_data[col] = 0.0
+            else:
+                normalized_data[col] = normalized_data[col].fillna(0.0)
+
+        normalized_data = normalized_data.drop(columns=['day_raw'], errors='ignore')
+        normalized_data = self._build_mimic_state_columns(normalized_data)
+
+        state_cols = self._get_state_cols()
+        for col in state_cols:
+            if col not in normalized_data.columns:
+                normalized_data[col] = 0.0
+
+        return normalized_data
+
     def _extract_insulin_daily(
         self, prescriptions: pd.DataFrame, subject_ids: set
     ) -> pd.DataFrame:
@@ -2923,6 +3061,14 @@ def parse_arguments():
     )
     parser.add_argument('--output-dir', type=str, default='outputs/integration_run')
     parser.add_argument('--mimic-dir', type=str, default='data/raw/mimic-iii')
+    parser.add_argument('--batch-size', type=int, default=512,
+                        help='Patient batch size for MIMIC feature preparation')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume MIMIC preparation from existing checkpoints when available')
+    parser.add_argument('--ignore-checkpoints', action='store_true',
+                        help='Ignore all existing checkpoints and recompute from scratch')
+    parser.add_argument('--checkpoint-dir', type=str, default=None,
+                        help='Directory for stage/batch checkpoints (default: <output-dir>/checkpoints/mimic)')
     parser.add_argument('--use-synthetic', action='store_true')
     parser.add_argument('--n-synthetic-patients', type=int, default=1000)
     parser.add_argument('--trajectory-length', type=int, default=30)

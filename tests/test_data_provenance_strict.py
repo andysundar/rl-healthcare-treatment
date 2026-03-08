@@ -23,6 +23,10 @@ def _cfg(tmp_path: Path, **overrides):
         use_transfer=False,
         use_interpretability=False,
         run_distillation=False,
+        batch_size=32,
+        resume=False,
+        ignore_checkpoints=False,
+        checkpoint_dir=None,
     )
     base.update(overrides)
     return Namespace(**base)
@@ -81,3 +85,33 @@ def test_validation_fails_if_synthetic_artifact_exists_in_mimic_run(tmp_path: Pa
 
     with pytest.raises(RuntimeError, match="Artifact validation failed"):
         runner._run_artifact_validation()
+
+
+def test_prepare_mimic_data_uses_final_checkpoint_when_resume_enabled(tmp_path: Path):
+    cfg = _cfg(
+        tmp_path,
+        resume=True,
+        ignore_checkpoints=False,
+        checkpoint_dir=str(tmp_path / "ckpts"),
+        mimic_dir=str(tmp_path / "missing_dir_is_ok_when_checkpoint_exists"),
+    )
+    runner = IntegratedSolutionRunner(cfg)
+    payload = {"source": "mimic", "train": [], "val": [], "test": [], "cohort": []}
+    runner._save_pickle_checkpoint("prepared_mimic_data", payload)
+
+    loaded = runner.prepare_mimic_data()
+    assert loaded == payload
+
+
+def test_prepare_mimic_data_missing_checkpoint_does_not_crash_resume_logic(tmp_path: Path):
+    cfg = _cfg(
+        tmp_path,
+        resume=True,
+        ignore_checkpoints=False,
+        checkpoint_dir=str(tmp_path / "ckpts"),
+        mimic_dir=str(tmp_path / "missing_mimic_dir"),
+    )
+    runner = IntegratedSolutionRunner(cfg)
+    assert runner._should_load_checkpoint("prepared_mimic_data", "pkl") is False
+    with pytest.raises(FileNotFoundError):
+        runner.prepare_mimic_data()

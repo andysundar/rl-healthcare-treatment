@@ -464,13 +464,26 @@ class CohortBuilder:
             cohort_patients[['subject_id', 'dob']],
             on='subject_id'
         )
-        
-        cohort_admissions['age_years'] = (
-            (cohort_admissions['admittime'] - cohort_admissions['dob']).dt.days / 365.25
+        cohort_admissions['admittime'] = pd.to_datetime(
+            cohort_admissions['admittime'], errors='coerce'
         )
-        
-        # Handle privacy shifts (ages > 200)
-        cohort_admissions.loc[cohort_admissions['age_years'] > 200, 'age_years'] = 91.5
+        cohort_admissions['dischtime'] = pd.to_datetime(
+            cohort_admissions['dischtime'], errors='coerce'
+        )
+        cohort_admissions['dob'] = pd.to_datetime(
+            cohort_admissions['dob'], errors='coerce'
+        )
+        cohort_admissions['age_years'] = cohort_admissions.apply(
+            lambda row: self._safe_age_at_admission(row['dob'], row['admittime']),
+            axis=1,
+        )
+        n_invalid_age = int(cohort_admissions['age_years'].isna().sum())
+        if n_invalid_age > 0:
+            logger.warning(
+                "Cohort statistics: %s/%s admission rows have invalid age and were excluded from age stats.",
+                n_invalid_age,
+                len(cohort_admissions),
+            )
         
         stats['age'] = {
             'mean': cohort_admissions['age_years'].mean(),
@@ -577,7 +590,78 @@ class CohortBuilder:
         logger.info(f"Cohort definition exported to {filepath}")
     
     # Private helper methods
-    
+
+    @staticmethod
+    def _safe_age_at_admission(
+        dob: pd.Timestamp,
+        admittime: pd.Timestamp,
+        privacy_shift_threshold: float = 200.0,
+        privacy_shift_age: float = 91.5,
+        max_reasonable_age: float = 130.0,
+    ) -> float:
+        """
+        Safely compute age in years without timedelta subtraction overflow.
+
+        Uses calendar arithmetic on year/month/day to avoid int64 datetime
+        subtraction overflow for malformed or shifted timestamps.
+        """
+        if pd.isna(dob) or pd.isna(admittime):
+            return np.nan
+
+        try:
+            dob = pd.to_datetime(dob, errors='coerce')
+            admittime = pd.to_datetime(admittime, errors='coerce')
+        except Exception:
+            return np.nan
+
+        if pd.isna(dob) or pd.isna(admittime):
+            return np.nan
+
+        if dob > admittime:
+            return np.nan
+
+        age = float(
+            admittime.year - dob.year
+            - int((admittime.month, admittime.day) < (dob.month, dob.day))
+        )
+
+        if age < 0:
+            return np.nan
+        if age > privacy_shift_threshold:
+            return float(privacy_shift_age)
+        if age > max_reasonable_age:
+            return np.nan
+        return age
+
+    def _build_age_frame_for_first_admission(self, subject_ids: Set[int]) -> pd.DataFrame:
+        """Return per-subject safe age at first admission with quality flags."""
+        cohort_admissions = self.admissions[
+            self.admissions['subject_id'].isin(subject_ids)
+        ][['subject_id', 'admittime']].copy()
+        cohort_patients = self.patients[
+            self.patients['subject_id'].isin(subject_ids)
+        ][['subject_id', 'dob']].copy()
+
+        cohort_admissions['admittime'] = pd.to_datetime(
+            cohort_admissions['admittime'], errors='coerce'
+        )
+        cohort_patients['dob'] = pd.to_datetime(
+            cohort_patients['dob'], errors='coerce'
+        )
+
+        first_adm = (
+            cohort_admissions
+            .dropna(subset=['admittime'])
+            .groupby('subject_id', as_index=False)['admittime']
+            .min()
+        )
+        merged = first_adm.merge(cohort_patients, on='subject_id', how='left')
+        merged['age_years'] = merged.apply(
+            lambda row: self._safe_age_at_admission(row['dob'], row['admittime']),
+            axis=1,
+        )
+        return merged
+
     def _filter_by_age(
         self,
         subject_ids: Set[int],
@@ -585,28 +669,28 @@ class CohortBuilder:
         max_age: Optional[float]
     ) -> Set[int]:
         """Filter by age at first admission."""
-        cohort_admissions = self.admissions[
-            self.admissions['subject_id'].isin(subject_ids)
-        ]
-        
-        first_admissions = cohort_admissions.groupby('subject_id')['admittime'].min()
-        
-        cohort_patients = self.patients[
-            self.patients['subject_id'].isin(subject_ids)
-        ].set_index('subject_id')
-        
-        ages = (first_admissions - cohort_patients['dob']).dt.days / 365.25
-        
-        # Handle privacy shifts
-        ages = ages.clip(upper=100)
-        
+        age_df = self._build_age_frame_for_first_admission(subject_ids)
+        n_missing_dates = int(age_df['dob'].isna().sum() + age_df['admittime'].isna().sum())
+        invalid_age_mask = age_df['age_years'].isna()
+        n_invalid_age = int(invalid_age_mask.sum())
+        if n_missing_dates > 0 or n_invalid_age > 0:
+            logger.warning(
+                "Age filter dropped %s/%s subjects due to datetime issues "
+                "(missing_dob_or_admittime=%s, invalid_or_impossible_age=%s).",
+                n_invalid_age,
+                len(age_df),
+                n_missing_dates,
+                n_invalid_age,
+            )
+
+        ages = age_df[['subject_id', 'age_years']].dropna(subset=['age_years'])
         if min_age is not None:
-            ages = ages[ages >= min_age]
+            ages = ages[ages['age_years'] >= min_age]
         if max_age is not None:
-            ages = ages[ages <= max_age]
-        
+            ages = ages[ages['age_years'] <= max_age]
+
         logger.info(f"Age filter: {len(ages)} subjects remain")
-        return set(ages.index)
+        return set(ages['subject_id'].astype(int).tolist())
     
     def _filter_by_admission_count(
         self,
