@@ -12,7 +12,8 @@ def test_demo_pipeline_runs(tmp_path: Path):
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stderr[-1000:]
-    assert (out / 'results_summary.json').exists()
-    assert (out / 'MASTER_RESULTS.csv').exists()
-    assert (out / 'safety_summary.csv').exists()
-    assert (out / 'ope_estimates.csv').exists()
+    resolved_out = out if (out / 'results_summary.json').exists() else out.with_name(f"{out.name}_synthetic")
+    assert (resolved_out / 'results_summary.json').exists()
+    assert (resolved_out / 'MASTER_RESULTS.csv').exists()
+    assert (resolved_out / 'safety_summary.csv').exists()
+    assert (resolved_out / 'ope_estimates.csv').exists()

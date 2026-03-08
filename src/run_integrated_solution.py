@@ -24,6 +24,7 @@ from datetime import datetime
 import json
 import hashlib
 import subprocess
+import shutil
 from typing import Dict, List, Tuple, Any
 
 import numpy as np
@@ -137,8 +138,11 @@ class IntegratedSolutionRunner:
         self.config = config
         seed_all(getattr(config, "seed", 42))
         self.results = {}
+        self.run_started_at = datetime.now()
+        self.requested_data_source = self._expected_data_source()
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._clear_previous_run_artifacts()
 
         logger.info("=" * 80)
         logger.info("RL HEALTHCARE TREATMENT - INTEGRATED SOLUTION")
@@ -169,6 +173,68 @@ class IntegratedSolutionRunner:
         """Return scalar state dimension based on active feature flags."""
         return len(self._get_state_cols())
 
+    def _expected_data_source(self) -> str:
+        """Infer intended dataset source from CLI flags."""
+        if bool(getattr(self.config, 'use_synthetic', False)) or str(getattr(self.config, 'mode', '')).lower() == 'synthetic':
+            return 'synthetic'
+        return 'mimic'
+
+    def _is_strict_mimic_run(self) -> bool:
+        return self.requested_data_source == 'mimic'
+
+    def _path_within_output(self, path_like: Any) -> bool:
+        try:
+            p = Path(path_like).resolve()
+            root = self.output_dir.resolve()
+            return p == root or root in p.parents
+        except Exception:
+            return False
+
+    def _register_plot_file(self, path: Path) -> None:
+        p = path.resolve()
+        if not self._path_within_output(p):
+            raise RuntimeError(f"Plot artifact path escapes output directory: {p}")
+        self.results.setdefault('plot_artifacts', [])
+        self.results['plot_artifacts'].append(str(p))
+
+    def _clear_previous_run_artifacts(self) -> None:
+        """Prevent stale artifacts from previous runs in reused output dirs."""
+        stale_files = [
+            'synthetic_data.pkl',
+            'mimic_trajectories.pkl',
+            'mimic_dataset_summary.json',
+            'results_summary.json',
+            'MASTER_RESULTS.csv',
+            'MASTER_RESULTS.md',
+            'safety_summary.csv',
+            'ope_estimates.csv',
+            'baseline_comparison_report.json',
+            'baseline_comparison_report.md',
+            'results_table.tex',
+            'thesis_figures.pdf',
+            'VALIDATION_FAILURES.md',
+            'RUN_PROVENANCE.json',
+            'ROOT_CAUSE_REPORT.md',
+        ]
+        stale_dirs = ['cql', 'encoder', 'interpretability']
+        for name in stale_files:
+            p = self.output_dir / name
+            if p.exists():
+                p.unlink()
+        for name in stale_dirs:
+            p = self.output_dir / name
+            if p.exists():
+                shutil.rmtree(p)
+        for p in self.output_dir.glob('*.png'):
+            p.unlink()
+
+    def _ensure_data_prepared(self) -> None:
+        if 'data' not in self.results:
+            self.stage_1_data_preparation()
+        source = self.results.get('data', {}).get('source', 'unknown')
+        if self._is_strict_mimic_run() and source != 'mimic':
+            raise RuntimeError(f"Strict provenance violation: expected MIMIC data, got '{source}'.")
+
     def _get_git_commit(self) -> str:
         """Return current git commit hash, if available."""
         try:
@@ -188,13 +254,18 @@ class IntegratedSolutionRunner:
         n_train = len(data.get('train', []))
         n_val = len(data.get('val', []))
         n_test = len(data.get('test', []))
+        source = data.get('source', 'unknown')
+        inferred_state_dim = int(len(np.asarray(data['train'][0][0]).reshape(-1))) if data.get('train') else int(self._get_state_dim())
         return {
             'run_timestamp': datetime.now().isoformat(),
             'seed': int(getattr(self.config, 'seed', 42)),
             'git_commit': self._get_git_commit(),
-            'data_source': data.get('source', 'unknown'),
+            'data_source': source,
+            'input_dataset_path': str(getattr(self.config, 'mimic_dir', '')) if source == 'mimic' else 'synthetic_generator',
             'n_patients': int(len(data.get('patients', data.get('cohort', [])))),
             'n_trajectories': int(n_train + n_val + n_test),
+            'state_dim': inferred_state_dim,
+            'action_dim': 1,
             'state_dimension': int(self._get_state_dim()),
             'action_dimension': 1,
             'reward_definition': 'in_range - 2*hypoglycemia - hyperglycemia + 0.5*medication_taken',
@@ -207,12 +278,59 @@ class IntegratedSolutionRunner:
         with open(path, 'w') as f:
             json.dump(out, f, indent=2)
 
+    def _write_run_provenance_manifest(self) -> None:
+        """Persist canonical provenance metadata for validation and packaging."""
+        manifest_path = self.output_dir / 'RUN_PROVENANCE.json'
+        manifest = self._provenance()
+        data = self.results.get('data', {})
+        manifest['input_dataset_path'] = data.get(
+            'input_dataset_path',
+            str(getattr(self.config, 'mimic_dir', '')) if manifest['data_source'] == 'mimic' else 'synthetic_generator',
+        )
+        manifest['requested_data_source'] = self.requested_data_source
+        manifest['mode'] = str(getattr(self.config, 'mode', 'unknown'))
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+
+    def _write_root_cause_report(self) -> None:
+        report = [
+            "# Root Cause Report: MIMIC Mode Producing Synthetic Artifacts",
+            "",
+            "## Why this happened",
+            "- CLI scenario used `--mode train-eval --mimic-dir ... --output-dir outputs/mimic_full`.",
+            "- `run_full_pipeline()` previously skipped Stage 1 for `train-eval`, so no MIMIC data was loaded.",
+            "- Downstream stages (`stage_2b_encoder_training` / `stage_3_baseline_training`) auto-generated synthetic data when `self.results['data']` was missing.",
+            "- Output folder and summary exporters then mixed labels/files, causing synthetic artifacts under a MIMIC-looking path.",
+            "",
+            "## Exact code path before fix",
+            "- `run_full_pipeline(): if mode in ['full','data-only'] -> stage_1_data_preparation()`",
+            "- `stage_2b_encoder_training(): if 'data' not in results -> prepare_synthetic_data()`",
+            "- `stage_3_baseline_training(): if 'data' not in results -> prepare_synthetic_data()`",
+            "- `stage_1_data_preparation(): except -> fallback to synthetic`",
+            "",
+            "## Preventive changes",
+            "- Stage 1 now runs for `train-eval`/`eval-only` modes as well.",
+            "- Removed silent fallback to synthetic from Stage 1 and later stages.",
+            "- Added strict source checks (`_ensure_data_prepared`) so MIMIC-intended runs fail hard if source is not MIMIC.",
+            "- Added `RUN_PROVENANCE.json` and stricter artifact validation before final packaging/reporting.",
+            "- Added stale-artifact cleanup and run-local plot tracking to avoid cross-run contamination.",
+        ]
+        (self.output_dir / 'ROOT_CAUSE_REPORT.md').write_text("\n".join(report) + "\n")
+
     def _normalize_output_dir_by_data_source(self) -> None:
         """Ensure folder naming reflects the actual data source."""
         source = self.results.get('data', {}).get('source', '').lower()
-        cur_name = self.output_dir.name.lower()
-        if source == 'synthetic' and 'mimic' in cur_name:
-            new_name = self.output_dir.name.lower().replace('mimic', 'synthetic')
+        cur_name = self.output_dir.name
+        cur_lower = cur_name.lower()
+        new_name = None
+        if source == 'synthetic':
+            if 'mimic' in cur_lower:
+                new_name = cur_name.lower().replace('mimic', 'synthetic')
+            elif 'synthetic' not in cur_lower:
+                new_name = f"{cur_name}_synthetic"
+        elif source == 'mimic':
+            if 'synthetic' in cur_lower:
+                new_name = cur_name.lower().replace('synthetic', 'mimic')
+        if new_name:
             new_dir = self.output_dir.parent / new_name
             new_dir.mkdir(parents=True, exist_ok=True)
             logger.warning(
@@ -220,6 +338,7 @@ class IntegratedSolutionRunner:
                 self.output_dir.name, source, new_dir,
             )
             self.output_dir = new_dir
+            self._clear_previous_run_artifacts()
 
     def run_full_pipeline(self):
         """Run complete end-to-end pipeline."""
@@ -230,7 +349,7 @@ class IntegratedSolutionRunner:
         if getattr(self.config, "defense_bundle", False):
             return self.run_defense_bundle()
 
-        if self.config.mode in ['full', 'data-only']:
+        if self.config.mode in ['full', 'data-only', 'train-eval', 'eval-only', 'synthetic']:
             self.stage_1_data_preparation()
 
         if self.config.mode in ['full', 'train-eval', 'synthetic']:
@@ -435,32 +554,19 @@ class IntegratedSolutionRunner:
         logger.info("\n" + "=" * 80)
         logger.info("STAGE 1: DATA PREPARATION")
         logger.info("=" * 80)
-
-        try:
-            if self.config.use_synthetic or self.config.mode == 'synthetic':
-                data = self.prepare_synthetic_data()
-            else:
-                data = self.prepare_mimic_data()
-
-            self.results['data'] = data
-            self._normalize_output_dir_by_data_source()
-            logger.info("Data preparation complete")
-
-        except Exception as e:
-            logger.error(f"Data preparation failed: {e}")
-            if self.config.mode != 'synthetic':
-                logger.info("Falling back to synthetic data...")
-                data = self.prepare_synthetic_data()
-                self.results['data'] = data
-                self._normalize_output_dir_by_data_source()
-            else:
-                raise
+        if self.requested_data_source == 'synthetic':
+            data = self.prepare_synthetic_data()
+        else:
+            data = self.prepare_mimic_data()
+        self.results['data'] = data
+        self._normalize_output_dir_by_data_source()
+        logger.info("Data preparation complete")
 
     def prepare_synthetic_data(self):
         """Generate synthetic patient data."""
         logger.info("Generating synthetic diabetes patient data...")
 
-        generator = SyntheticDataGenerator(random_seed=42)
+        generator = SyntheticDataGenerator(random_seed=int(getattr(self.config, 'seed', 42)))
 
         patients = generator.generate_diabetes_population(
             n_patients=self.config.n_synthetic_patients
@@ -503,7 +609,7 @@ class IntegratedSolutionRunner:
             state_cols=state_cols,
             action_col='action',
             reward_col='reward',
-            seed=42,
+            seed=int(getattr(self.config, 'seed', 42)),
         )
         builder = DeterministicTrajectoryBuilder(tb_cfg)
         train_df, val_df, test_df = builder.patient_split(all_df, ratios=(0.7, 0.15, 0.15))
@@ -537,7 +643,10 @@ class IntegratedSolutionRunner:
 
         from data import MIMICLoader, CohortBuilder, FeatureEngineer, DataPreprocessor
 
-        loader = MIMICLoader(data_dir=self.config.mimic_dir, use_cache=True)
+        mimic_dir = Path(self.config.mimic_dir)
+        if not mimic_dir.exists():
+            raise FileNotFoundError(f"MIMIC directory not found: {mimic_dir}")
+        loader = MIMICLoader(data_dir=str(mimic_dir), use_cache=True)
 
         patients    = loader.load_patients()
         admissions  = loader.load_admissions()
@@ -711,7 +820,7 @@ class IntegratedSolutionRunner:
 
         # --- Patient-level train / val / test split ---
         unique_pts = list(set(final_cohort))
-        rng        = np.random.default_rng(42)
+        rng        = np.random.default_rng(int(getattr(self.config, 'seed', 42)))
         rng.shuffle(unique_pts)
         n_train = int(0.70 * len(unique_pts))
         n_val   = int(0.15 * len(unique_pts))
@@ -737,7 +846,26 @@ class IntegratedSolutionRunner:
             'cohort':       final_cohort,
             'source':       'mimic',
             'state_cols':   state_cols,
+            'input_dataset_path': str(mimic_dir.resolve()),
         }
+        if not train_data or not test_data:
+            raise RuntimeError(
+                f"MIMIC trajectory build produced insufficient data (train={len(train_data)}, test={len(test_data)})."
+            )
+        import pickle
+        mimic_path = self.output_dir / 'mimic_trajectories.pkl'
+        with open(mimic_path, 'wb') as f:
+            pickle.dump(data, f)
+        summary_path = self.output_dir / 'mimic_dataset_summary.json'
+        summary_path.write_text(json.dumps({
+            'input_dataset_path': str(mimic_dir.resolve()),
+            'n_patients': int(len(final_cohort)),
+            'n_train_trajectories': int(len(train_data)),
+            'n_val_trajectories': int(len(val_data)),
+            'n_test_trajectories': int(len(test_data)),
+            'state_dim': int(len(state_cols)),
+            'action_dim': 1,
+        }, indent=2))
         logger.info(
             f"MIMIC trajectories — Train: {len(train_data):,} | "
             f"Val: {len(val_data):,} | Test: {len(test_data):,}"
@@ -803,13 +931,8 @@ class IntegratedSolutionRunner:
         logger.info("STAGE 2b: ENCODER PRE-TRAINING")
         logger.info("=" * 80)
 
-        if 'data' not in self.results:
-            logger.info("No data yet — generating synthetic data for encoder training...")
-            data = self.prepare_synthetic_data()
-            self.results['data'] = data
-            self._normalize_output_dir_by_data_source()
-        else:
-            data = self.results['data']
+        self._ensure_data_prepared()
+        data = self.results['data']
 
         from models.encoders import PatientAutoencoder, EncoderConfig
         from models.encoders.state_encoder_wrapper import StateEncoderWrapper
@@ -920,21 +1043,14 @@ class IntegratedSolutionRunner:
         logger.info("STAGE 3: BASELINE TRAINING")
         logger.info("=" * 80)
 
-        if 'data' in self.results:
-            data = self.results['data']
-            if data['source'] == 'synthetic':
-                test_data = data['test']
-                train_data = data['train']
-            else:
-                test_data = self._convert_to_trajectory_format(data['test'])
-                train_data = self._convert_to_trajectory_format(data['train'])
-        else:
-            logger.info("Generating synthetic data for baselines...")
-            data = self.prepare_synthetic_data()
-            self.results['data'] = data
-            self._normalize_output_dir_by_data_source()
+        self._ensure_data_prepared()
+        data = self.results['data']
+        if data['source'] == 'synthetic':
             test_data = data['test']
             train_data = data['train']
+        else:
+            test_data = self._convert_to_trajectory_format(data['test'])
+            train_data = self._convert_to_trajectory_format(data['train'])
 
         # Derive state_dim from actual data to stay correct with --use-vitals / --use-med-history
         state_dim = len(train_data[0][0]) if train_data else self._get_state_dim()
@@ -1590,8 +1706,14 @@ class IntegratedSolutionRunner:
             'output_directory': str(self.output_dir),
             'dataset_identity': {
                 'data_source': self.results.get('data', {}).get('source', 'unknown'),
+                'input_dataset_path': self.results.get('data', {}).get(
+                    'input_dataset_path',
+                    str(getattr(self.config, 'mimic_dir', '')) if self.results.get('data', {}).get('source') == 'mimic' else 'synthetic_generator',
+                ),
                 'n_patients': len(self.results.get('data', {}).get('patients', self.results.get('data', {}).get('cohort', []))),
                 'n_trajectories': len(self.results.get('data', {}).get('train', [])) + len(self.results.get('data', {}).get('val', [])) + len(self.results.get('data', {}).get('test', [])),
+                'state_dim': self._get_state_dim(),
+                'action_dim': 1,
                 'state_dimension': self._get_state_dim(),
                 'action_dimension': 1,
                 'reward_definition': 'in_range - 2*hypoglycemia - hyperglycemia + 0.5*medication_taken',
@@ -1633,6 +1755,8 @@ class IntegratedSolutionRunner:
             }
 
         self._write_json_with_provenance(summary_path, summary)
+        self._write_run_provenance_manifest()
+        self._write_root_cause_report()
 
         logger.info(f"Results summary saved to {summary_path}")
 
@@ -1642,6 +1766,7 @@ class IntegratedSolutionRunner:
         if not getattr(self.config, 'demo', False) and not getattr(self.config, 'defense_bundle', False):
             self._generate_visualizations()
         else:
+            self.results['plot_artifacts'] = []
             logger.info("Visualization generation skipped in demo/defense-bundle mode.")
         self._run_artifact_validation()
 
@@ -2174,6 +2299,19 @@ class IntegratedSolutionRunner:
 
     def _run_artifact_validation(self) -> None:
         failures = []
+        source = self.results.get('data', {}).get('source', 'unknown')
+        out_name = self.output_dir.name.lower()
+        manifest_path = self.output_dir / 'RUN_PROVENANCE.json'
+        if not manifest_path.exists():
+            failures.append("RUN_PROVENANCE.json missing.")
+        else:
+            try:
+                manifest = json.loads(manifest_path.read_text())
+                if manifest.get('data_source') != source:
+                    failures.append("RUN_PROVENANCE data_source mismatches in-memory data source.")
+            except Exception:
+                failures.append("RUN_PROVENANCE.json is not valid JSON.")
+
         rules_path = self.output_dir / 'decision_rules.txt'
         if rules_path.exists() and rules_path.read_text().strip() == "|--- class: 0":
             failures.append("Placeholder decision rules detected in decision_rules.txt.")
@@ -2215,9 +2353,34 @@ class IntegratedSolutionRunner:
                 if np.isfinite(expected) and abs(expected - observed) > 1e-9:
                     failures.append(f"Contradictory safety values for policy {p}.")
 
-        source = self.results.get('data', {}).get('source', 'unknown')
-        if source == 'synthetic' and 'mimic' in self.output_dir.name.lower():
+        if source == 'synthetic' and 'mimic' in out_name:
             failures.append("Output directory label implies MIMIC while data_source is synthetic.")
+        if source == 'mimic' and 'synthetic' in out_name:
+            failures.append("Output directory label implies synthetic while data_source is MIMIC.")
+        if self._is_strict_mimic_run() and source != 'mimic':
+            failures.append("Strict MIMIC run ended with non-MIMIC data source.")
+        if source == 'mimic' and (self.output_dir / 'synthetic_data.pkl').exists():
+            failures.append("synthetic_data.pkl present in MIMIC run output.")
+        if source == 'mimic':
+            required = [
+                self.output_dir / 'mimic_trajectories.pkl',
+                self.output_dir / 'mimic_dataset_summary.json',
+            ]
+            missing = [str(p) for p in required if not p.exists()]
+            if missing:
+                failures.append(f"Missing required MIMIC-derived trajectory artifacts: {missing}")
+            expected_path = str(Path(getattr(self.config, 'mimic_dir', '')).resolve())
+            got_path = str(self.results.get('data', {}).get('input_dataset_path', ''))
+            if got_path != expected_path:
+                failures.append(f"MIMIC input_dataset_path mismatch: expected '{expected_path}', got '{got_path}'.")
+
+        for pstr in self.results.get('plot_artifacts', []):
+            p = Path(pstr)
+            if not self._path_within_output(p):
+                failures.append(f"Plot artifact outside run directory: {p}")
+                continue
+            if p.exists() and datetime.fromtimestamp(p.stat().st_mtime) < self.run_started_at:
+                failures.append(f"Stale plot artifact reused from earlier run: {p.name}")
 
         master_path = self.output_dir / 'MASTER_RESULTS.csv'
         if master_path.exists():
@@ -2285,6 +2448,7 @@ class IntegratedSolutionRunner:
             sns.set_style('whitegrid')
             plt.rcParams.update({'font.size': 11})
             comparison = self.results['baselines']['comparison']
+            generated_plots: List[Path] = []
 
             # ----------------------------------------------------------
             # Fig 1: Baseline comparison (2 panels — reward + safety)
@@ -2307,6 +2471,8 @@ class IntegratedSolutionRunner:
             path1 = self.output_dir / 'baseline_comparison.png'
             plt.savefig(path1, dpi=300, bbox_inches='tight')
             plt.close()
+            generated_plots.append(path1)
+            self._register_plot_file(path1)
             logger.info(f"Saved {path1}")
 
             # ----------------------------------------------------------
@@ -2339,6 +2505,8 @@ class IntegratedSolutionRunner:
             path2 = self.output_dir / 'policy_dashboard.png'
             plt.savefig(path2, dpi=300, bbox_inches='tight')
             plt.close()
+            generated_plots.append(path2)
+            self._register_plot_file(path2)
             logger.info(f"Saved {path2}")
 
             # ----------------------------------------------------------
@@ -2355,6 +2523,9 @@ class IntegratedSolutionRunner:
                     save_path=str(path_comp),
                 )
                 plt.close('all')
+                if path_comp.exists():
+                    generated_plots.append(path_comp)
+                    self._register_plot_file(path_comp)
                 logger.info(f"Saved {path_comp}")
             except Exception as _e:
                 logger.warning(f"comparison.png skipped: {_e}")
@@ -2376,6 +2547,9 @@ class IntegratedSolutionRunner:
                         save_path=str(path_hm),
                     )
                     plt.close('all')
+                    if path_hm.exists():
+                        generated_plots.append(path_hm)
+                        self._register_plot_file(path_hm)
                     logger.info(f"Saved {path_hm}")
             except Exception as _e:
                 logger.warning(f"health_metrics.png skipped: {_e}")
@@ -2415,6 +2589,8 @@ class IntegratedSolutionRunner:
                     path3 = self.output_dir / 'cql_training_curves.png'
                     plt.savefig(path3, dpi=300, bbox_inches='tight')
                     plt.close()
+                    generated_plots.append(path3)
+                    self._register_plot_file(path3)
                     logger.info(f"Saved {path3}")
 
             # ----------------------------------------------------------
@@ -2422,9 +2598,8 @@ class IntegratedSolutionRunner:
             # ----------------------------------------------------------
             if 'interpretability' in self.results:
                 import json as _json
-                rules_json = self.results['interpretability'].get('rules_path', '')
-                if rules_json:
-                    fi_path = str(rules_json).replace('.txt', '.json')
+                fi_path = self.output_dir / 'feature_importances.json'
+                if fi_path.exists():
                     try:
                         with open(fi_path) as fh:
                             fi = _json.load(fh)
@@ -2443,6 +2618,8 @@ class IntegratedSolutionRunner:
                             path4 = self.output_dir / 'feature_importance.png'
                             plt.savefig(path4, dpi=300, bbox_inches='tight')
                             plt.close()
+                            generated_plots.append(path4)
+                            self._register_plot_file(path4)
                             logger.info(f"Saved {path4}")
                     except Exception as e:
                         logger.warning(f"Feature importance chart skipped: {e}")
@@ -2463,6 +2640,8 @@ class IntegratedSolutionRunner:
                     path5 = self.output_dir / 'personalization_score.png'
                     plt.savefig(path5, dpi=300, bbox_inches='tight')
                     plt.close()
+                    generated_plots.append(path5)
+                    self._register_plot_file(path5)
                     logger.info(f"Saved {path5}")
 
             # ----------------------------------------------------------
@@ -2493,6 +2672,8 @@ class IntegratedSolutionRunner:
                     path6 = self.output_dir / 'safety_clinical_heatmap.png'
                     plt.savefig(path6, dpi=300, bbox_inches='tight')
                     plt.close()
+                    generated_plots.append(path6)
+                    self._register_plot_file(path6)
                     logger.info(f"Saved {path6}")
 
             # ----------------------------------------------------------
@@ -2501,8 +2682,7 @@ class IntegratedSolutionRunner:
             try:
                 from matplotlib.backends.backend_pdf import PdfPages
                 pdf_path = self.output_dir / 'thesis_figures.pdf'
-                pngs = [p for p in self.output_dir.glob('*.png')
-                        if p.name != 'thesis_figures.pdf']
+                pngs = [p for p in generated_plots if p.exists()]
                 if pngs:
                     with PdfPages(pdf_path) as pdf:
                         for png in sorted(pngs):
@@ -2516,9 +2696,13 @@ class IntegratedSolutionRunner:
                                          fontsize=11, pad=8)
                             pdf.savefig(fig, bbox_inches='tight')
                             plt.close(fig)
+                    self.results['plot_artifacts'] = [str(p.resolve()) for p in pngs]
                     logger.info(f"Saved thesis PDF: {pdf_path}")
             except Exception as e:
                 logger.warning(f"Thesis PDF generation failed: {e}")
+
+            if 'plot_artifacts' not in self.results:
+                self.results['plot_artifacts'] = [str(p.resolve()) for p in generated_plots if p.exists()]
 
         except Exception as e:
             logger.warning(f"Visualization generation failed: {e}", exc_info=True)
