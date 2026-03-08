@@ -272,7 +272,17 @@ class IntegratedSolutionRunner:
 
     def _save_parquet_checkpoint(self, name: str, df: pd.DataFrame) -> Path:
         path = self._checkpoint_path(name, 'parquet')
-        df.to_parquet(path, index=False)
+        out = df.copy()
+        cat_cols = out.select_dtypes(include=['category']).columns.tolist()
+        if cat_cols:
+            logger.info(
+                "Converting categorical columns to string before parquet checkpoint '%s': %s",
+                name,
+                cat_cols,
+            )
+            for c in cat_cols:
+                out[c] = out[c].astype('string')
+        out.to_parquet(path, index=False)
         logger.info("Saved checkpoint: %s (rows=%s)", path, len(df))
         return path
 
@@ -281,6 +291,28 @@ class IntegratedSolutionRunner:
         df = pd.read_parquet(path)
         logger.info("Loaded checkpoint: %s (rows=%s)", path, len(df))
         return df
+
+    def _write_missing_data_report(self, policy) -> None:
+        """Persist compact missing-data policy report for debugging/reproducibility."""
+        rows = []
+        for col, strat in policy.strategies.items():
+            rows.append({
+                'column_name': col,
+                'missing_rate_before': float(policy.missing_rates_before.get(col, np.nan)),
+                'strategy': strat,
+                'fill_value': policy.numeric_fill_values.get(col, None),
+                'category_policy': (
+                    f"vocab_size={len(policy.categorical_vocab.get(col, []))}"
+                    if col in policy.categorical_vocab else ''
+                ),
+                'mask_added': int(f"{col}_missing" in policy.mask_columns),
+            })
+        if not rows:
+            return
+        report_df = pd.DataFrame(rows).sort_values('column_name')
+        report_path = self.output_dir / 'missing_data_report.csv'
+        report_df.to_csv(report_path, index=False)
+        logger.info("Saved missing-data report: %s", report_path)
 
     def _get_git_commit(self) -> str:
         """Return current git commit hash, if available."""
@@ -699,7 +731,14 @@ class IntegratedSolutionRunner:
             logger.info("Using fully prepared MIMIC dataset from checkpoint.")
             return payload
 
-        from data import MIMICLoader, CohortBuilder, FeatureEngineer
+        from data import (
+            MIMICLoader,
+            CohortBuilder,
+            FeatureEngineer,
+            MissingDataPolicyConfig,
+            fit_missing_data_policy,
+            transform_with_missing_data_policy,
+        )
 
         mimic_dir = Path(self.config.mimic_dir)
         if not mimic_dir.exists():
@@ -823,15 +862,52 @@ class IntegratedSolutionRunner:
         val_pts = set(unique_pts[n_train:n_train + n_val])
         test_pts = set(unique_pts[n_train + n_val:])
 
-        train_data = self._build_mimic_trajectories(
-            normalized_data[normalized_data['subject_id'].isin(train_pts)], state_cols
+        train_df = normalized_data[normalized_data['subject_id'].isin(train_pts)].copy()
+        val_df = normalized_data[normalized_data['subject_id'].isin(val_pts)].copy()
+        test_df = normalized_data[normalized_data['subject_id'].isin(test_pts)].copy()
+
+        md_cfg = MissingDataPolicyConfig(
+            group_cols=('subject_id', 'hadm_id'),
+            time_col='charttime',
+            enable_missingness_masks=not bool(getattr(self.config, 'disable_missingness_masks', False)),
+            enable_time_since_last_observed=bool(getattr(self.config, 'enable_time_since_last_observed', False)),
+            numeric_fill_stat='median',
+            categorical_unknown_token='UNKNOWN',
+            lab_max_hold_steps=getattr(self.config, 'lab_max_hold_steps', None),
+            vital_max_hold_steps=getattr(self.config, 'vital_max_hold_steps', None),
+            drop_high_missingness_columns=bool(getattr(self.config, 'drop_high_missingness_columns', False)),
+            high_missingness_threshold=float(getattr(self.config, 'high_missingness_threshold', 0.95)),
+            columns_exempt_from_imputation=('day',),
+            zero_fill_columns=('medication_taken', 'reminder_sent', 'hypoglycemia', 'hyperglycemia'),
+            report_path=str(self.output_dir / 'missing_data_report.csv'),
         )
-        val_data = self._build_mimic_trajectories(
-            normalized_data[normalized_data['subject_id'].isin(val_pts)], state_cols
+        missing_policy = fit_missing_data_policy(
+            train_df,
+            md_cfg,
+            numeric_columns=state_cols,
+            categorical_columns=[],
+            time_varying_columns=[c for c in state_cols if c not in MED_HISTORY_COLS],
+            static_numeric_columns=[c for c in state_cols if c in MED_HISTORY_COLS],
         )
-        test_data = self._build_mimic_trajectories(
-            normalized_data[normalized_data['subject_id'].isin(test_pts)], state_cols
+        train_df = transform_with_missing_data_policy(train_df, missing_policy)
+        val_df = transform_with_missing_data_policy(val_df, missing_policy)
+        test_df = transform_with_missing_data_policy(test_df, missing_policy)
+
+        mask_cols = [c for c in train_df.columns if c.endswith('_missing') and c[:-8] in state_cols]
+        tsl_cols = [c for c in train_df.columns if c.startswith('time_since_last_') and c[len('time_since_last_'):] in state_cols]
+        base_model_state_cols = [c for c in state_cols if c in train_df.columns]
+        model_state_cols = base_model_state_cols + sorted(mask_cols) + sorted(tsl_cols)
+
+        self._write_missing_data_report(missing_policy)
+        logger.info(
+            "Missing-data policy fit on train only. Added %s mask columns. Final state_dim=%s",
+            len(mask_cols),
+            len(model_state_cols),
         )
+
+        train_data = self._build_mimic_trajectories(train_df, model_state_cols)
+        val_data = self._build_mimic_trajectories(val_df, model_state_cols)
+        test_data = self._build_mimic_trajectories(test_df, model_state_cols)
 
         data = {
             'train': train_data,
@@ -840,7 +916,7 @@ class IntegratedSolutionRunner:
             'demographics': demographics,
             'cohort': final_cohort,
             'source': 'mimic',
-            'state_cols': state_cols,
+            'state_cols': model_state_cols,
             'input_dataset_path': str(mimic_dir.resolve()),
             'batch_size': batch_size,
             'n_feature_batches': n_batches,
@@ -863,12 +939,13 @@ class IntegratedSolutionRunner:
             'n_train_trajectories': int(len(train_data)),
             'n_val_trajectories': int(len(val_data)),
             'n_test_trajectories': int(len(test_data)),
-            'state_dim': int(len(state_cols)),
+            'state_dim': int(len(model_state_cols)),
             'action_dim': 1,
             'batch_size': batch_size,
             'n_feature_batches': n_batches,
             'resume_used': bool(getattr(self.config, 'resume', False)),
             'ignore_checkpoints': bool(getattr(self.config, 'ignore_checkpoints', False)),
+            'missing_masks_added': int(len(mask_cols)),
         }, indent=2))
         logger.info(
             f"MIMIC trajectories — Train: {len(train_data):,} | "
@@ -3069,6 +3146,18 @@ def parse_arguments():
                         help='Ignore all existing checkpoints and recompute from scratch')
     parser.add_argument('--checkpoint-dir', type=str, default=None,
                         help='Directory for stage/batch checkpoints (default: <output-dir>/checkpoints/mimic)')
+    parser.add_argument('--disable-missingness-masks', action='store_true',
+                        help='Disable explicit missingness mask features in MIMIC preprocessing')
+    parser.add_argument('--enable-time-since-last-observed', action='store_true',
+                        help='Enable optional time-since-last-observed features (if supported by policy)')
+    parser.add_argument('--lab-max-hold-steps', type=int, default=None,
+                        help='Max forward-fill hold steps for sparse lab features (None = unbounded)')
+    parser.add_argument('--vital-max-hold-steps', type=int, default=None,
+                        help='Max forward-fill hold steps for vital features (None = unbounded)')
+    parser.add_argument('--drop-high-missingness-columns', action='store_true',
+                        help='Drop columns above high missingness threshold in missing-data policy')
+    parser.add_argument('--high-missingness-threshold', type=float, default=0.95,
+                        help='Threshold used with --drop-high-missingness-columns')
     parser.add_argument('--use-synthetic', action='store_true')
     parser.add_argument('--n-synthetic-patients', type=int, default=1000)
     parser.add_argument('--trajectory-length', type=int, default=30)

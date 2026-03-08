@@ -29,6 +29,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DEFAULT_MISSING_TOKEN = "UNKNOWN"
+MISSING_STRING_TOKENS = {
+    "",
+    " ",
+    "na",
+    "n/a",
+    "nan",
+    "none",
+    "null",
+    "unknown",
+    "unknown/not specified",
+    "not specified",
+    "not recorded",
+    "not available",
+}
+
 
 class AgeBucket(Enum):
     """Age categories for patient stratification."""
@@ -104,26 +120,25 @@ class AgeBucketing:
             This function detects and corrects for this shift.
         """
         try:
-            age_timedelta = admittime - dob
-            age_years = age_timedelta.days / 365.25
-            
-            # Handle MIMIC-III privacy shift
+            dob = pd.to_datetime(dob, errors='coerce')
+            admittime = pd.to_datetime(admittime, errors='coerce')
+            if pd.isna(dob) or pd.isna(admittime):
+                return np.nan
+            if dob > admittime:
+                return np.nan
+
+            age_years = float(
+                admittime.year - dob.year
+                - int((admittime.month, admittime.day) < (dob.month, dob.day))
+            )
             if handle_privacy_shift and age_years > 200:
-                # Privacy-shifted - patient is >89
-                # Assign median age for very elderly
                 age_years = 91.5
-                logger.debug(f"Privacy-shifted age detected, using {age_years}")
-            
-            # Handle negative ages (data error)
-            if age_years < 0:
-                logger.warning(f"Negative age calculated: {age_years}, using 0")
-                age_years = 0
-            
+            if age_years < 0 or age_years > 130:
+                return np.nan
             return age_years
-            
         except Exception as e:
             logger.error(f"Error calculating age: {e}")
-            return 0.0
+            return np.nan
     
     @staticmethod
     def bucket_to_numeric(bucket: AgeBucket) -> int:
@@ -185,6 +200,86 @@ class FeatureEngineer:
         self.label_encoders: Dict[str, LabelEncoder] = {}
         self.age_bucketing = AgeBucketing()
         logger.info("Initialized FeatureEngineer")
+
+    @staticmethod
+    def normalize_string_missing(
+        series: pd.Series,
+        fill_value: str = DEFAULT_MISSING_TOKEN,
+    ) -> pd.Series:
+        """Normalize text-like missing placeholders to a stable sentinel."""
+        s = series.copy()
+        if isinstance(s.dtype, pd.CategoricalDtype):
+            s = s.astype('string')
+        elif not pd.api.types.is_string_dtype(s):
+            s = s.astype('string')
+        else:
+            s = s.astype('string')
+        s = s.str.strip()
+        lower = s.str.lower()
+        missing_mask = s.isna() | lower.isin(MISSING_STRING_TOKENS)
+        s = s.mask(missing_mask, fill_value)
+        return s.fillna(fill_value)
+
+    @classmethod
+    def safe_fill_categorical(
+        cls,
+        series: pd.Series,
+        fill_value: str = DEFAULT_MISSING_TOKEN,
+    ) -> pd.Series:
+        """Safely fill missing values for categorical/object-like columns."""
+        s = series.copy()
+        if isinstance(s.dtype, pd.CategoricalDtype):
+            if fill_value not in s.cat.categories:
+                s = s.cat.add_categories([fill_value])
+            s = s.fillna(fill_value)
+            s = cls.normalize_string_missing(s.astype('string'), fill_value=fill_value)
+            return s
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+            return cls.normalize_string_missing(s, fill_value=fill_value)
+        return s
+
+    @staticmethod
+    def safe_fill_numeric(
+        series: pd.Series,
+        default: Optional[float] = None,
+    ) -> pd.Series:
+        """Safely coerce numeric series and fill missing values."""
+        s = pd.to_numeric(series, errors='coerce')
+        if default is None:
+            default = float(s.median()) if s.notna().any() else 0.0
+        return s.fillna(default)
+
+    def _safe_label_encode(
+        self,
+        name: str,
+        series: pd.Series,
+        unknown_token: str = DEFAULT_MISSING_TOKEN,
+    ) -> np.ndarray:
+        """Label encode robustly, mapping unseen labels to UNKNOWN."""
+        s = self.normalize_string_missing(series, fill_value=unknown_token)
+        if name not in self.label_encoders:
+            enc = LabelEncoder()
+            enc.fit(sorted(set(s.tolist() + [unknown_token])))
+            self.label_encoders[name] = enc
+        enc = self.label_encoders[name]
+        known_classes = set(enc.classes_)
+        if unknown_token not in known_classes:
+            enc.fit(sorted(set(list(enc.classes_) + [unknown_token])))
+            known_classes = set(enc.classes_)
+        s = s.where(s.isin(known_classes), unknown_token)
+        return enc.transform(s)
+
+    def _normalize_categorical_feature_column(
+        self,
+        df: pd.DataFrame,
+        column: str,
+        fill_value: str = DEFAULT_MISSING_TOKEN,
+    ) -> pd.DataFrame:
+        if column not in df.columns:
+            logger.warning("Demographics column '%s' missing; creating with fallback '%s'.", column, fill_value)
+            df[column] = fill_value
+        df[column] = self.safe_fill_categorical(df[column], fill_value=fill_value)
+        return df
     
     def extract_demographics(
         self,
@@ -218,35 +313,37 @@ class FeatureEngineer:
         """
         logger.info(f"Extracting demographics for {len(patients)} patients")
         
+        if 'subject_id' not in patients.columns:
+            raise ValueError("patients DataFrame must include 'subject_id'")
+
         demo_features = pd.DataFrame()
         demo_features['subject_id'] = patients['subject_id']
-        
-        # Gender
-        demo_features['gender'] = patients['gender']
-        if 'gender' not in self.label_encoders:
-            self.label_encoders['gender'] = LabelEncoder()
-            self.label_encoders['gender'].fit(['M', 'F'])
-        demo_features['gender_encoded'] = self.label_encoders['gender'].transform(
-            demo_features['gender'].fillna('M')
-        )
+
+        # Gender (robust normalization + encoding)
+        raw_gender = patients['gender'] if 'gender' in patients.columns else pd.Series([pd.NA] * len(patients))
+        demo_features['gender'] = self.safe_fill_categorical(raw_gender, fill_value=DEFAULT_MISSING_TOKEN)
+        demo_features['gender_encoded'] = self._safe_label_encode('gender', demo_features['gender'])
         
         # Age calculation
         if reference_time is None:
             reference_time = pd.Timestamp.now()
         
-        if admissions is not None:
-            # Calculate age at first admission
+        admissions_usable = (
+            admissions is not None
+            and 'subject_id' in admissions.columns
+            and 'admittime' in admissions.columns
+        )
+        if admissions_usable:
+            admissions = admissions.copy()
+            admissions['admittime'] = pd.to_datetime(admissions['admittime'], errors='coerce')
             first_admissions = admissions.groupby('subject_id')['admittime'].min().reset_index()
             demo_features = demo_features.merge(first_admissions, on='subject_id', how='left')
-            
-            # Merge with patients to get DOB
             demo_features = demo_features.merge(
-                patients[['subject_id', 'dob']],
+                patients[['subject_id', 'dob']] if 'dob' in patients.columns else pd.DataFrame({'subject_id': patients['subject_id'], 'dob': pd.NaT}),
                 on='subject_id',
                 how='left'
             )
-            
-            # Calculate age at admission
+            demo_features['dob'] = pd.to_datetime(demo_features['dob'], errors='coerce')
             demo_features['age_years'] = demo_features.apply(
                 lambda row: self.age_bucketing.calculate_age_at_admission(
                     row['dob'], row['admittime']
@@ -254,18 +351,23 @@ class FeatureEngineer:
                 axis=1
             )
         else:
+            if admissions is not None:
+                logger.warning("Admissions missing subject_id/admittime; using reference_time age fallback.")
             # Calculate current age
             demo_features = demo_features.merge(
-                patients[['subject_id', 'dob']],
+                patients[['subject_id', 'dob']] if 'dob' in patients.columns else pd.DataFrame({'subject_id': patients['subject_id'], 'dob': pd.NaT}),
                 on='subject_id',
                 how='left'
             )
-            
+            demo_features['dob'] = pd.to_datetime(demo_features['dob'], errors='coerce')
             demo_features['age_years'] = demo_features['dob'].apply(
                 lambda dob: self.age_bucketing.calculate_age_at_admission(
                     dob, reference_time
                 ) if pd.notna(dob) else np.nan
             )
+
+        # Numeric stabilization for age
+        demo_features['age_years'] = self.safe_fill_numeric(demo_features['age_years'], default=np.nan)
         
         # Age bucketing
         demo_features['age_bucket'] = demo_features['age_years'].apply(
@@ -287,28 +389,49 @@ class FeatureEngineer:
             ).astype(int)
         
         # Mortality
+        dod_src = patients[['subject_id', 'dod']].copy() if 'dod' in patients.columns else pd.DataFrame({'subject_id': patients['subject_id'], 'dod': pd.NaT})
+        dod_src['dod'] = pd.to_datetime(dod_src['dod'], errors='coerce')
         demo_features = demo_features.merge(
-            patients[['subject_id', 'dod']],
+            dod_src,
             on='subject_id',
             how='left',
             suffixes=('', '_patient')
         )
         demo_features['is_deceased'] = demo_features['dod'].notna().astype(int)
-        
-        # Ethnicity (if admissions available)
-        if admissions is not None and 'ethnicity' in admissions.columns:
-            ethnicity = admissions.groupby('subject_id')['ethnicity'].first().reset_index()
-            demo_features = demo_features.merge(ethnicity, on='subject_id', how='left')
-            
-            # Encode ethnicity
-            if 'ethnicity' not in self.label_encoders:
-                self.label_encoders['ethnicity'] = LabelEncoder()
-                unique_ethnicities = demo_features['ethnicity'].dropna().unique()
-                self.label_encoders['ethnicity'].fit(unique_ethnicities)
-            
-            demo_features['ethnicity_encoded'] = self.label_encoders['ethnicity'].transform(
-                demo_features['ethnicity'].fillna('UNKNOWN')
-            )
+
+        # Demographic categorical features from admissions (first known value per subject)
+        admission_demo_cols = [
+            'ethnicity',
+            'insurance',
+            'marital_status',
+            'admission_type',
+            'admission_location',
+            'discharge_location',
+        ]
+        admissions_for_demo = admissions if (admissions is not None and 'subject_id' in admissions.columns) else None
+        if admissions_for_demo is not None:
+            for col in admission_demo_cols:
+                if col in admissions_for_demo.columns:
+                    col_df = admissions_for_demo.groupby('subject_id')[col].first().reset_index()
+                    demo_features = demo_features.merge(col_df, on='subject_id', how='left')
+                else:
+                    logger.warning("Admissions missing expected column '%s'.", col)
+        elif admissions is not None:
+            logger.warning("Admissions missing 'subject_id'; admission demographics fallback to UNKNOWN.")
+
+        demo_features = self._normalize_categorical_feature_column(demo_features, 'gender')
+        for col in admission_demo_cols:
+            demo_features = self._normalize_categorical_feature_column(demo_features, col)
+            demo_features[f'{col}_encoded'] = self._safe_label_encode(col, demo_features[col])
+
+        # Missing-data summary logs
+        for col in ['gender', 'ethnicity', 'insurance', 'marital_status', 'admission_type']:
+            if col in demo_features.columns:
+                n_unknown = int((demo_features[col] == DEFAULT_MISSING_TOKEN).sum())
+                logger.info(
+                    "Demographics normalization: column='%s' unknown_count=%s/%s",
+                    col, n_unknown, len(demo_features),
+                )
         
         # Clean up temporary columns
         cols_to_drop = ['dob', 'admittime', 'dod']
@@ -316,6 +439,11 @@ class FeatureEngineer:
             columns=[c for c in cols_to_drop if c in demo_features.columns]
         )
         
+        # Ensure stable string dtype for categorical-like fields for batch concat robustness.
+        for col in ['gender'] + admission_demo_cols + ['age_bucket']:
+            if col in demo_features.columns:
+                demo_features[col] = demo_features[col].astype('string')
+
         logger.info(f"Extracted {len(demo_features.columns)} demographic features")
         return demo_features
     
@@ -561,7 +689,15 @@ class FeatureEngineer:
         
         # Ensure datetime
         if not pd.api.types.is_datetime64_any_dtype(df_temporal[time_column]):
-            df_temporal[time_column] = pd.to_datetime(df_temporal[time_column])
+            df_temporal[time_column] = pd.to_datetime(df_temporal[time_column], errors='coerce')
+        n_bad_time = int(df_temporal[time_column].isna().sum())
+        if n_bad_time > 0:
+            logger.warning(
+                "Temporal features: dropping %s rows with invalid '%s' timestamps.",
+                n_bad_time,
+                time_column,
+            )
+            df_temporal = df_temporal.dropna(subset=[time_column])
         
         # Sort by subject and time
         df_temporal = df_temporal.sort_values([subject_column, time_column])
@@ -578,9 +714,44 @@ class FeatureEngineer:
                                     (df_temporal['time_of_day'] <= 6)).astype(int)
         
         # Rolling statistics for numeric columns
-        numeric_cols = df_temporal.select_dtypes(include=[np.number]).columns
-        numeric_cols = [c for c in numeric_cols if c not in [subject_column, 'time_of_day', 
-                                                               'day_of_week', 'is_weekend', 'is_night']]
+        excluded_cols = {
+            subject_column,
+            time_column,
+            'time_since_last',           # timedelta helper column
+            'time_since_last_hours',     # engineered gap feature (do not roll recursively)
+            'time_of_day',
+            'day_of_week',
+            'is_weekend',
+            'is_night',
+        }
+        numeric_cols = []
+        for col in df_temporal.columns:
+            if col in excluded_cols:
+                continue
+            s = df_temporal[col]
+            if pd.api.types.is_timedelta64_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
+                logger.warning(
+                    "Skipping temporal rolling features for '%s' (dtype=%s: non-scalar time dtype).",
+                    col,
+                    s.dtype,
+                )
+                continue
+            if not pd.api.types.is_numeric_dtype(s):
+                logger.warning(
+                    "Skipping temporal rolling features for '%s' (dtype=%s: non-numeric).",
+                    col,
+                    s.dtype,
+                )
+                continue
+            coerced = pd.to_numeric(s, errors='coerce')
+            if coerced.notna().sum() == 0:
+                logger.warning(
+                    "Skipping temporal rolling features for '%s' (all values non-numeric after coercion).",
+                    col,
+                )
+                continue
+            df_temporal[col] = coerced
+            numeric_cols.append(col)
         
         for col in numeric_cols:
             # 3-point rolling mean

@@ -1,6 +1,7 @@
 from argparse import Namespace
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from src.run_integrated_solution import IntegratedSolutionRunner
@@ -115,3 +116,18 @@ def test_prepare_mimic_data_missing_checkpoint_does_not_crash_resume_logic(tmp_p
     assert runner._should_load_checkpoint("prepared_mimic_data", "pkl") is False
     with pytest.raises(FileNotFoundError):
         runner.prepare_mimic_data()
+
+
+def test_save_parquet_checkpoint_converts_categorical_columns(tmp_path: Path):
+    cfg = _cfg(
+        tmp_path,
+        checkpoint_dir=str(tmp_path / "ckpts"),
+    )
+    runner = IntegratedSolutionRunner(cfg)
+    df = pd.DataFrame({
+        "subject_id": [1, 2],
+        "ethnicity": pd.Series(["WHITE", "ASIAN"], dtype="category"),
+    })
+    runner._save_parquet_checkpoint("cat_batch", df)
+    loaded = runner._load_parquet_checkpoint("cat_batch")
+    assert "ethnicity" in loaded.columns

@@ -40,6 +40,12 @@ from .trajectory_builder import (
     TrajectoryBuildConfig,
     DeterministicTrajectoryBuilder
 )
+from .missing_data_policy import (
+    MissingDataPolicyConfig,
+    FittedMissingDataPolicy,
+    fit_missing_data_policy,
+    transform_with_missing_data_policy,
+)
 from .utils import (
     load_icd9_mappings,
     lookup_icd9_description,
@@ -86,6 +92,10 @@ __all__ = [
     # Trajectory builder
     'TrajectoryBuildConfig',
     'DeterministicTrajectoryBuilder',
+    'MissingDataPolicyConfig',
+    'FittedMissingDataPolicy',
+    'fit_missing_data_policy',
+    'transform_with_missing_data_policy',
     
     # Utilities
     'load_icd9_mappings',
