@@ -70,6 +70,65 @@ python src/run_integrated_solution.py \
     --output-dir outputs/smoke
 ```
 
+### Fast local iteration on laptop (Apple Silicon friendly)
+
+Use fast-eval mode for quick debugging runs; this is not for final thesis metrics.
+
+```bash
+python src/run_integrated_solution.py \
+    --mode train-eval \
+    --mimic-dir /path/to/mimic \
+    --fast-eval \
+    --skip-slow-baselines \
+    --max-eval-samples 1000 \
+    --light-report \
+    --output-dir outputs/mimic_fast_debug
+```
+
+Full-fidelity run (final experiments):
+
+```bash
+python src/run_integrated_solution.py \
+    --mode train-eval \
+    --mimic-dir /path/to/mimic \
+    --train-cql \
+    --output-dir outputs/mimic_full
+```
+
+### Resume and save-point workflows
+
+Resume from existing stage checkpoints:
+
+```bash
+python src/run_integrated_solution.py \
+    --mode train-eval \
+    --mimic-dir /path/to/mimic \
+    --resume \
+    --output-dir outputs/mimic_full
+```
+
+Start from a specific stage and stop after another:
+
+```bash
+python src/run_integrated_solution.py \
+    --mode train-eval \
+    --resume \
+    --start-from stage_3_baseline_training \
+    --stop-after stage_5_evaluation \
+    --output-dir outputs/mimic_full
+```
+
+Invalidate downstream checkpoints and recompute:
+
+```bash
+python src/run_integrated_solution.py \
+    --mode train-eval \
+    --resume \
+    --invalidate-from stage_2b_encoder_training \
+    --force-stage stage_3_baseline_training \
+    --output-dir outputs/mimic_full
+```
+
 ### 3. Run the PDF alignment test suite
 
 ```bash

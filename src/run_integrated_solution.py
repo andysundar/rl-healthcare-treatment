@@ -135,6 +135,9 @@ MED_HISTORY_COLS = ['adherence_rate_7d', 'medication_count']
 class IntegratedSolutionRunner:
     """Main class for running the integrated RL healthcare solution."""
 
+    CHECKPOINT_SCHEMA_VERSION = 2
+    ROLLOUT_CACHE_SCHEMA_VERSION = 2
+
     PIPELINE_STAGE_ORDER = [
         'stage_1_data_preparation',
         'stage_2_environment_setup',
@@ -163,6 +166,20 @@ class IntegratedSolutionRunner:
         'stage_7b_policy_distillation': ['policy_distillation'],
         'stage_6_report_inputs': ['report_inputs'],
         'stage_6_generate_reports': ['plot_artifacts', 'master_results'],
+    }
+    STAGE_CHECKPOINT_SCHEMA_VERSIONS = {
+        'stage_1_data_preparation': 2,
+        'stage_2_environment_setup': 1,
+        'stage_2b_encoder_training': 2,
+        'stage_3_baseline_training': 3,
+        'stage_4_cql_training': 2,
+        'stage_4b_iql_training': 2,
+        'stage_5_evaluation': 3,
+        'stage_6b_transfer': 1,
+        'stage_7_interpretability': 1,
+        'stage_7b_policy_distillation': 1,
+        'stage_6_report_inputs': 1,
+        'stage_6_generate_reports': 2,
     }
 
     STAGE_ALIAS = {
@@ -291,14 +308,31 @@ class IntegratedSolutionRunner:
     def _atomic_write_bytes(self, path: Path, data: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_suffix(path.suffix + '.tmp')
-        with open(tmp_path, 'wb') as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        try:
+            with open(tmp_path, 'wb') as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+            raise
 
     def _atomic_write_json(self, path: Path, payload: Dict[str, Any]) -> None:
         blob = json.dumps(payload, indent=2, default=str).encode('utf-8')
+        self._atomic_write_bytes(path, blob)
+
+    def _atomic_write_pickle(self, path: Path, obj: Any) -> None:
+        import pickle
+        blob = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        self._atomic_write_bytes(path, blob)
+
+    def _atomic_write_text(self, path: Path, text: str) -> None:
+        blob = text.encode('utf-8')
         self._atomic_write_bytes(path, blob)
 
     def _load_pipeline_manifest(self) -> Dict[str, Any]:
@@ -335,6 +369,8 @@ class IntegratedSolutionRunner:
             'config_hash': self._compute_config_hash(),
             'dataset_signature': self._compute_dataset_signature(),
             'git_commit': self._get_git_commit(),
+            'checkpoint_schema_version': int(self.CHECKPOINT_SCHEMA_VERSION),
+            'stage_schema_version': int(self.STAGE_CHECKPOINT_SCHEMA_VERSIONS.get(step_name, 1)),
         }
         if metadata:
             meta.update(metadata)
@@ -375,12 +411,31 @@ class IntegratedSolutionRunner:
             with open(ckpt_path, 'rb') as f:
                 payload = pickle.load(f)
             meta = payload.get('meta', {})
+            saved_ckpt_schema = int(meta.get('checkpoint_schema_version', -1))
+            if saved_ckpt_schema != int(self.CHECKPOINT_SCHEMA_VERSION):
+                logger.info(
+                    "Checkpoint invalid for %s: checkpoint schema mismatch (saved=%s current=%s)",
+                    step_name, saved_ckpt_schema, self.CHECKPOINT_SCHEMA_VERSION,
+                )
+                return False
+            saved_stage_schema = int(meta.get('stage_schema_version', -1))
+            current_stage_schema = int(self.STAGE_CHECKPOINT_SCHEMA_VERSIONS.get(step_name, 1))
+            if saved_stage_schema != current_stage_schema:
+                logger.info(
+                    "Checkpoint invalid for %s: schema version mismatch (saved=%s current=%s)",
+                    step_name, saved_stage_schema, current_stage_schema,
+                )
+                return False
             if meta.get('config_hash') != config_hash:
+                logger.info("Checkpoint invalid for %s: config hash mismatch", step_name)
                 return False
             if meta.get('dataset_signature') != dataset_signature:
+                logger.info("Checkpoint invalid for %s: dataset signature mismatch", step_name)
                 return False
+            logger.info("Checkpoint valid for %s", step_name)
             return True
-        except Exception:
+        except Exception as e:
+            logger.info("Checkpoint invalid for %s: failed to parse checkpoint (%s)", step_name, e)
             return False
 
     def _collect_step_artifact_paths(self, step_name: str) -> List[str]:
@@ -392,6 +447,7 @@ class IntegratedSolutionRunner:
                     paths.append(str(p.resolve()))
         elif step_name == 'stage_3_baseline_training':
             for name in [
+                'baseline_policy_summary.csv',
                 'baseline_policy_raw_evaluation.csv',
                 'baseline_policy_episode_summary.csv',
                 'baseline_comparison_report.json',
@@ -404,7 +460,7 @@ class IntegratedSolutionRunner:
             if p.exists():
                 paths.append(str(p.resolve()))
         elif step_name == 'stage_5_evaluation':
-            for name in ['evaluation_policy_raw_evaluation.csv', 'evaluation_policy_episode_summary.csv', 'ope_estimates.csv', 'safety_summary.csv']:
+            for name in ['evaluation_policy_summary.csv', 'evaluation_policy_raw_evaluation.csv', 'evaluation_policy_episode_summary.csv', 'ope_estimates.csv', 'safety_summary.csv']:
                 p = self.output_dir / name
                 if p.exists():
                     paths.append(str(p.resolve()))
@@ -436,17 +492,20 @@ class IntegratedSolutionRunner:
             forced = step_name in force_steps
 
         can_resume = bool(getattr(self.config, 'resume', False)) and not forced
-        if can_resume and self.is_checkpoint_valid(step_name, config_hash, dataset_signature):
-            loaded = self.load_checkpoint(step_name)
-            if loaded is not None:
-                if isinstance(loaded, dict):
-                    self.results.update(loaded)
-                logger.info("Skipping %s; valid checkpoint found", step_name)
-                stage_entry = self.pipeline_manifest.setdefault('stages', {}).setdefault(step_name, {})
-                stage_entry['status'] = 'completed'
-                stage_entry['last_loaded_at'] = datetime.now().isoformat()
-                self._persist_pipeline_manifest()
-                return
+        if can_resume:
+            if self.is_checkpoint_valid(step_name, config_hash, dataset_signature):
+                loaded = self.load_checkpoint(step_name)
+                if loaded is not None:
+                    if isinstance(loaded, dict):
+                        self.results.update(loaded)
+                    logger.info("Skipping %s; valid checkpoint found", step_name)
+                    stage_entry = self.pipeline_manifest.setdefault('stages', {}).setdefault(step_name, {})
+                    stage_entry['status'] = 'completed'
+                    stage_entry['last_loaded_at'] = datetime.now().isoformat()
+                    self._persist_pipeline_manifest()
+                    return
+            else:
+                logger.info("Recomputing %s due to checkpoint validation failure.", step_name)
 
         stage_entry = self.pipeline_manifest.setdefault('stages', {}).setdefault(step_name, {})
         stage_entry['status'] = 'running'
@@ -532,22 +591,28 @@ class IntegratedSolutionRunner:
 
     def _save_pickle_checkpoint(self, name: str, obj: Any) -> Path:
         path = self._checkpoint_path(name, 'pkl')
-        import pickle
-        with open(path, 'wb') as f:
-            pickle.dump(obj, f)
-        logger.info("Saved checkpoint: %s", path)
+        self._atomic_write_pickle(path, obj)
+        logger.info("Atomic checkpoint write complete: %s", path)
         return path
 
-    def _load_pickle_checkpoint(self, name: str) -> Any:
+    def _load_pickle_checkpoint(self, name: str) -> Optional[Any]:
         path = self._checkpoint_path(name, 'pkl')
         import pickle
-        with open(path, 'rb') as f:
-            obj = pickle.load(f)
-        logger.info("Loaded checkpoint: %s", path)
-        return obj
+        try:
+            with open(path, 'rb') as f:
+                obj = pickle.load(f)
+            logger.info("Loaded checkpoint: %s", path)
+            return obj
+        except (pickle.UnpicklingError, EOFError, OSError, ValueError) as e:
+            logger.warning(
+                "Failed to load checkpoint %s: corrupt or incomplete file; recomputing (%s)",
+                name, e,
+            )
+            return None
 
     def _save_parquet_checkpoint(self, name: str, df: pd.DataFrame) -> Path:
         path = self._checkpoint_path(name, 'parquet')
+        tmp_path = path.with_name(path.name + '.tmp')
         out = df.copy()
         cat_cols = out.select_dtypes(include=['category']).columns.tolist()
         if cat_cols:
@@ -558,15 +623,31 @@ class IntegratedSolutionRunner:
             )
             for c in cat_cols:
                 out[c] = out[c].astype('string')
-        out.to_parquet(path, index=False)
-        logger.info("Saved checkpoint: %s (rows=%s)", path, len(df))
+        try:
+            out.to_parquet(tmp_path, index=False)
+            os.replace(tmp_path, path)
+        except Exception:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+            raise
+        logger.info("Atomic checkpoint write complete: %s (rows=%s)", path, len(df))
         return path
 
-    def _load_parquet_checkpoint(self, name: str) -> pd.DataFrame:
+    def _load_parquet_checkpoint(self, name: str) -> Optional[pd.DataFrame]:
         path = self._checkpoint_path(name, 'parquet')
-        df = pd.read_parquet(path)
-        logger.info("Loaded checkpoint: %s (rows=%s)", path, len(df))
-        return df
+        try:
+            df = pd.read_parquet(path)
+            logger.info("Loaded checkpoint: %s (rows=%s)", path, len(df))
+            return df
+        except (OSError, ValueError, EOFError) as e:
+            logger.warning(
+                "Ignoring unreadable checkpoint at %s: corrupt/incomplete parquet (%s)",
+                path, e,
+            )
+            return None
 
     def _write_missing_data_report(self, policy) -> None:
         """Persist compact missing-data policy report for debugging/reproducibility."""
@@ -630,8 +711,8 @@ class IntegratedSolutionRunner:
     def _write_json_with_provenance(self, path: Path, payload: Dict[str, Any]) -> None:
         out = dict(payload)
         out['provenance'] = self._provenance()
-        with open(path, 'w') as f:
-            json.dump(out, f, indent=2)
+        # Use atomic write to prevent corrupted artifacts if run is interrupted
+        self._atomic_write_json(path, out)
 
     def _write_run_provenance_manifest(self) -> None:
         """Persist canonical provenance metadata for validation and packaging."""
@@ -644,7 +725,8 @@ class IntegratedSolutionRunner:
         )
         manifest['requested_data_source'] = self.requested_data_source
         manifest['mode'] = str(getattr(self.config, 'mode', 'unknown'))
-        manifest_path.write_text(json.dumps(manifest, indent=2))
+        # Use atomic write to prevent corrupted artifacts if run is interrupted
+        self._atomic_write_json(manifest_path, manifest)
 
     def _write_root_cause_report(self) -> None:
         report = [
@@ -990,9 +1072,8 @@ class IntegratedSolutionRunner:
         }
 
         output_path = self.output_dir / 'synthetic_data.pkl'
-        import pickle
-        with open(output_path, 'wb') as f:
-            pickle.dump(data, f)
+        # Use atomic write to prevent corrupted artifacts if run is interrupted
+        self._atomic_write_pickle(output_path, data)
 
         logger.info(f"Saved synthetic data to {output_path}")
         return data
@@ -1009,8 +1090,9 @@ class IntegratedSolutionRunner:
 
         if self._should_load_checkpoint('prepared_mimic_data', 'pkl'):
             payload = self._load_pickle_checkpoint('prepared_mimic_data')
-            logger.info("Using fully prepared MIMIC dataset from checkpoint.")
-            return payload
+            if payload is not None:
+                logger.info("Using fully prepared MIMIC dataset from checkpoint.")
+                return payload
 
         from data import (
             MIMICLoader,
@@ -1035,12 +1117,20 @@ class IntegratedSolutionRunner:
 
         if self._should_load_checkpoint('01_diabetes_patients', 'pkl'):
             diabetes_pts = self._load_pickle_checkpoint('01_diabetes_patients')
+            if diabetes_pts is None:
+                diabetes_pts = builder.define_diabetes_cohort()
+                self._save_pickle_checkpoint('01_diabetes_patients', diabetes_pts)
         else:
             diabetes_pts = builder.define_diabetes_cohort()
             self._save_pickle_checkpoint('01_diabetes_patients', diabetes_pts)
 
         if self._should_load_checkpoint('02_inclusion_filtered_patients', 'pkl'):
             filtered_pts = self._load_pickle_checkpoint('02_inclusion_filtered_patients')
+            if filtered_pts is None:
+                filtered_pts = builder.apply_inclusion_criteria(
+                    diabetes_pts, min_age=18, max_age=80, min_admissions=2
+                )
+                self._save_pickle_checkpoint('02_inclusion_filtered_patients', filtered_pts)
         else:
             filtered_pts = builder.apply_inclusion_criteria(
                 diabetes_pts, min_age=18, max_age=80, min_admissions=2
@@ -1049,6 +1139,11 @@ class IntegratedSolutionRunner:
 
         if self._should_load_checkpoint('03_final_cohort_patients', 'pkl'):
             final_cohort = self._load_pickle_checkpoint('03_final_cohort_patients')
+            if final_cohort is None:
+                final_cohort = builder.apply_exclusion_criteria(
+                    filtered_pts, exclude_pregnancy=True, exclude_pediatric=True
+                )
+                self._save_pickle_checkpoint('03_final_cohort_patients', final_cohort)
         else:
             final_cohort = builder.apply_exclusion_criteria(
                 filtered_pts, exclude_pregnancy=True, exclude_pediatric=True
@@ -1071,6 +1166,11 @@ class IntegratedSolutionRunner:
 
         if self._should_load_checkpoint('04_demographics', 'parquet'):
             demographics = self._load_parquet_checkpoint('04_demographics')
+            if demographics is None:
+                engineer = FeatureEngineer()
+                demographics = engineer.extract_demographics(patients, admissions)
+                demographics = demographics[demographics['subject_id'].isin(final_cohort)]
+                self._save_parquet_checkpoint('04_demographics', demographics)
         else:
             engineer = FeatureEngineer()
             demographics = engineer.extract_demographics(patients, admissions)
@@ -1099,13 +1199,14 @@ class IntegratedSolutionRunner:
 
             if self._should_load_checkpoint(batch_name, 'parquet'):
                 batch_df = self._load_parquet_checkpoint(batch_name)
-                logger.info(
-                    "Batch %s/%s loaded from checkpoint (%s patients, %s rows).",
-                    batch_idx + 1, n_batches, len(batch_subject_ids), len(batch_df),
-                )
-                if len(batch_df) > 0:
-                    non_empty_batch_names.append(batch_name)
-                continue
+                if batch_df is not None:
+                    logger.info(
+                        "Batch %s/%s loaded from checkpoint (%s patients, %s rows).",
+                        batch_idx + 1, n_batches, len(batch_subject_ids), len(batch_df),
+                    )
+                    if len(batch_df) > 0:
+                        non_empty_batch_names.append(batch_name)
+                    continue
 
             logger.info(
                 "Processing batch %s/%s (%s patients)...",
@@ -1125,7 +1226,12 @@ class IntegratedSolutionRunner:
             )
 
         logger.info("Assembling %s non-empty feature batches...", len(non_empty_batch_names))
-        batch_frames = [self._load_parquet_checkpoint(name) for name in non_empty_batch_names]
+        batch_frames = []
+        for name in non_empty_batch_names:
+            df_ckpt = self._load_parquet_checkpoint(name)
+            if df_ckpt is None:
+                raise RuntimeError(f"Checkpoint {name} became unreadable during assembly; rerun with --ignore-checkpoints.")
+            batch_frames.append(df_ckpt)
         normalized_data = pd.concat(batch_frames, ignore_index=True)
 
         state_cols = self._get_state_cols()
@@ -1207,14 +1313,14 @@ class IntegratedSolutionRunner:
                 f"MIMIC trajectory build produced insufficient data (train={len(train_data)}, test={len(test_data)})."
             )
 
-        import pickle
         mimic_path = self.output_dir / 'mimic_trajectories.pkl'
-        with open(mimic_path, 'wb') as f:
-            pickle.dump(data, f)
+        # Use atomic write to prevent corrupted artifacts if run is interrupted
+        self._atomic_write_pickle(mimic_path, data)
         self._save_pickle_checkpoint('prepared_mimic_data', data)
 
         summary_path = self.output_dir / 'mimic_dataset_summary.json'
-        summary_path.write_text(json.dumps({
+        # Use atomic write to prevent corrupted artifacts if run is interrupted
+        self._atomic_write_json(summary_path, {
             'input_dataset_path': str(mimic_dir.resolve()),
             'n_patients': int(len(final_cohort)),
             'n_train_trajectories': int(len(train_data)),
@@ -1227,7 +1333,7 @@ class IntegratedSolutionRunner:
             'resume_used': bool(getattr(self.config, 'resume', False)),
             'ignore_checkpoints': bool(getattr(self.config, 'ignore_checkpoints', False)),
             'missing_masks_added': int(len(mask_cols)),
-        }, indent=2))
+        })
         logger.info(
             f"MIMIC trajectories — Train: {len(train_data):,} | "
             f"Val: {len(val_data):,} | Test: {len(test_data):,}"
@@ -1745,16 +1851,34 @@ class IntegratedSolutionRunner:
             eval_policies['IQL'] = self.results['iql']['agent']
 
         # Per-policy rollouts used as source of truth for reward/safety summaries.
-        # Reuse Stage 3 baseline rollout results when policy set is identical.
+        # Reuse Stage 3 rollout only when full evaluation signature matches.
         baseline_rollout = self.results.get('baseline_rollouts')
-        baseline_policy_names = set(self.results.get('baselines', {}).get('policies', {}).keys())
-        eval_policy_names = set(eval_policies.keys())
-        if (
-            baseline_rollout is not None
-            and eval_policy_names == baseline_policy_names
-            and len(test_data) == int(self.results.get('baselines', {}).get('fast_eval_used_test_size', len(test_data)))
-        ):
-            logger.info("Using cached baseline evaluation results from Stage 3 rollouts")
+        eval_policy_names = sorted(list(eval_policies.keys()))
+        current_eval_signature = self._build_rollout_signature(
+            policies=eval_policies,
+            train_data=train_data,
+            eval_data=test_data,
+            cache_extra={
+                'fast_eval': bool(getattr(self.config, 'fast_eval', False)),
+                'max_eval_samples': int(getattr(self.config, 'max_eval_samples', 0) or 0),
+                'policy_set': eval_policy_names,
+            },
+        )
+        can_reuse_stage3 = False
+        if baseline_rollout is not None:
+            prev_sig = baseline_rollout.get('evaluation_signature', {})
+            can_reuse_stage3, reason = self._rollout_reuse_check(prev_sig, current_eval_signature)
+            if can_reuse_stage3:
+                logger.info("Stage 5 rollout reuse signature matched; reusing Stage 3 results")
+            else:
+                if reason == "dataset signature changed":
+                    logger.info("Stage 5 rollout reuse rejected: dataset signature changed")
+                elif reason == "policy artifact fingerprint changed":
+                    logger.info("Stage 5 rollout reuse rejected: policy artifact fingerprint changed")
+                else:
+                    logger.info("Stage 5 rollout reuse rejected: evaluation signature changed")
+
+        if can_reuse_stage3:
             rollout_eval = baseline_rollout
         else:
             rollout_eval = self._run_policy_rollout_evaluation(
@@ -1767,7 +1891,7 @@ class IntegratedSolutionRunner:
                 cache_extra={
                     'fast_eval': bool(getattr(self.config, 'fast_eval', False)),
                     'max_eval_samples': int(getattr(self.config, 'max_eval_samples', 0) or 0),
-                    'policy_set': sorted(list(eval_policy_names)),
+                    'policy_set': eval_policy_names,
                 },
             )
         summary_df = rollout_eval['summary_df']
@@ -2528,8 +2652,160 @@ class IntegratedSolutionRunner:
             h.update(ns_arr[:16].round(5).tobytes())
         return h.hexdigest()
 
+    def _policy_fingerprint(self, policy: Any) -> Dict[str, Any]:
+        """Build a stable lightweight fingerprint for policy identity validation."""
+        fp: Dict[str, Any] = {
+            'module': type(policy).__module__,
+            'class': type(policy).__name__,
+            'name': getattr(policy, 'name', None),
+        }
+        for attr in ['seed', 'distribution', 'k', 'regression_type', 'alpha', 'normalize', 'state_dim']:
+            if hasattr(policy, attr):
+                try:
+                    fp[attr] = getattr(policy, attr)
+                except Exception:
+                    pass
+        # Include small scalar fields from __dict__ for stricter identity checks.
+        try:
+            for k, v in getattr(policy, '__dict__', {}).items():
+                if k in fp or k.startswith('_'):
+                    continue
+                if isinstance(v, (str, int, float, bool, type(None))):
+                    fp[f"attr_{k}"] = v
+                elif isinstance(v, np.ndarray) and v.size <= 32:
+                    fp[f"attr_{k}"] = np.asarray(v).reshape(-1).tolist()
+        except Exception:
+            pass
+        if hasattr(policy, 'is_fitted'):
+            fp['is_fitted'] = bool(getattr(policy, 'is_fitted'))
+
+        def _array_sample_digest(arr: np.ndarray, max_elems: int = 2048) -> str:
+            flat = np.asarray(arr).reshape(-1)
+            if flat.size > max_elems:
+                flat = flat[:max_elems]
+            return hashlib.sha256(np.asarray(flat, dtype=np.float32).round(6).tobytes()).hexdigest()
+
+        # sklearn linear models
+        model = getattr(policy, 'model', None)
+        if model is not None:
+            if hasattr(model, 'coef_'):
+                try:
+                    coef = np.asarray(model.coef_)
+                    fp['model_coef_shape'] = tuple(coef.shape)
+                    fp['model_coef_digest'] = _array_sample_digest(coef)
+                except Exception:
+                    pass
+            if hasattr(model, 'intercept_'):
+                try:
+                    intercept = np.asarray(model.intercept_)
+                    fp['model_intercept_shape'] = tuple(intercept.shape)
+                    fp['model_intercept_digest'] = _array_sample_digest(intercept)
+                except Exception:
+                    pass
+
+        # KNN fitted data digest (sampled)
+        knn_model = getattr(policy, 'knn_model', None)
+        if knn_model is not None and hasattr(knn_model, '_fit_X'):
+            try:
+                xfit = np.asarray(knn_model._fit_X)
+                fp['knn_fit_shape'] = tuple(xfit.shape)
+                fp['knn_fit_digest'] = _array_sample_digest(xfit)
+            except Exception:
+                pass
+
+        # Torch-network digest (sampled from state_dict)
+        network = getattr(policy, 'network', None)
+        if network is not None and hasattr(network, 'state_dict'):
+            try:
+                sd = network.state_dict()
+                h = hashlib.sha256()
+                total_params = 0
+                for k in sorted(sd.keys()):
+                    t = sd[k].detach().cpu().numpy().reshape(-1)
+                    total_params += int(t.size)
+                    if t.size > 2048:
+                        t = t[:2048]
+                    h.update(k.encode('utf-8'))
+                    h.update(np.asarray(t, dtype=np.float32).round(6).tobytes())
+                fp['network_param_count'] = total_params
+                fp['network_digest'] = h.hexdigest()
+            except Exception:
+                pass
+
+        return fp
+
+    def _build_rollout_signature(
+        self,
+        policies: Dict[str, Any],
+        train_data: List[Tuple],
+        eval_data: List[Tuple],
+        cache_extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        safety_cfg = EvaluationConfig().safety
+        signature = {
+            'rollout_cache_schema_version': int(self.ROLLOUT_CACHE_SCHEMA_VERSION),
+            'policy_names': sorted(list(policies.keys())),
+            'policy_fingerprints': {
+                k: self._policy_fingerprint(v) for k, v in sorted(policies.items(), key=lambda kv: kv[0])
+            },
+            'train_signature': self._transitions_signature(train_data),
+            'eval_signature': self._transitions_signature(eval_data),
+            'eval_size': int(len(eval_data)),
+            'seed': int(getattr(self.config, 'seed', 42)),
+            'safe_glucose_range': list(safety_cfg.safe_glucose_range),
+            'rollout_model_version': 1,
+        }
+        if cache_extra:
+            signature['cache_extra'] = dict(cache_extra)
+        signature_json = json.dumps(signature, sort_keys=True, default=str)
+        signature['signature_hash'] = hashlib.sha256(signature_json.encode('utf-8')).hexdigest()
+        return signature
+
+    def _rollout_reuse_check(
+        self,
+        previous_signature: Optional[Dict[str, Any]],
+        current_signature: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        if not previous_signature:
+            return False, "no previous signature"
+        if previous_signature.get('rollout_cache_schema_version') != current_signature.get('rollout_cache_schema_version'):
+            return False, "evaluation signature changed"
+        if previous_signature.get('eval_signature') != current_signature.get('eval_signature'):
+            return False, "dataset signature changed"
+        if previous_signature.get('policy_names') != current_signature.get('policy_names'):
+            return False, "policy set changed"
+        if previous_signature.get('cache_extra') != current_signature.get('cache_extra'):
+            return False, "evaluation signature changed"
+        if previous_signature.get('policy_fingerprints') != current_signature.get('policy_fingerprints'):
+            return False, "policy artifact fingerprint changed"
+        return True, "signature matched"
+
     def _rollout_cache_path(self, export_prefix: str) -> Path:
         return self.output_dir / f"{export_prefix}_rollout_cache.pkl"
+
+    def _load_rollout_cache(self, cache_file: Path) -> Optional[Dict[str, Any]]:
+        if not cache_file.exists():
+            return None
+        try:
+            import pickle
+            with open(cache_file, 'rb') as f:
+                payload = pickle.load(f)
+            if not isinstance(payload, dict):
+                raise ValueError("cache payload must be dict")
+            return payload
+        except Exception as e:
+            logger.warning(
+                "Ignoring corrupt rollout cache / failed to load cache, recomputing: %s (%s)",
+                cache_file, e,
+            )
+            return None
+
+    def _save_rollout_cache(self, cache_file: Path, payload: Dict[str, Any]) -> None:
+        import pickle
+        logger.info("Saving rollout cache atomically to %s", cache_file)
+        blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+        self._atomic_write_bytes(cache_file, blob)
+        logger.info("Rollout cache write complete")
 
     def _run_policy_rollout_evaluation(
         self,
@@ -2543,28 +2819,45 @@ class IntegratedSolutionRunner:
     ) -> Dict[str, Any]:
         """Evaluate each policy with independent model-based rollouts and export raw traces."""
         cache_file = self._rollout_cache_path(export_prefix)
-        cache_meta = {
-            'policy_names': list(policies.keys()),
-            'train_signature': self._transitions_signature(train_data),
-            'eval_signature': self._transitions_signature(eval_data),
-            'export_prefix': export_prefix,
-            'seed': int(getattr(self.config, 'seed', 42)),
-        }
-        if cache_extra:
-            cache_meta.update(cache_extra)
+        eval_signature = self._build_rollout_signature(
+            policies=policies,
+            train_data=train_data,
+            eval_data=eval_data,
+            cache_extra=cache_extra,
+        )
 
         if use_cache and cache_file.exists() and not force_recompute:
-            try:
-                import pickle
-                with open(cache_file, 'rb') as f:
-                    payload = pickle.load(f)
-                if payload.get('cache_meta') == cache_meta:
+            payload = self._load_rollout_cache(cache_file)
+            if payload is not None:
+                saved_sig = payload.get('evaluation_signature', {})
+                can_reuse, reason = self._rollout_reuse_check(saved_sig, eval_signature)
+                if can_reuse:
                     logger.info("Found cached baseline evaluation results at %s", cache_file)
                     logger.info("Reusing cached results for %s baselines", len(policies))
-                    return payload['rollout_payload']
-                logger.info("Cache miss: evaluation parameters changed")
-            except Exception as e:
-                logger.warning("Failed to load rollout cache from %s: %s", cache_file, e)
+                    summary_path = str(payload.get('summary_path', ''))
+                    if summary_path and Path(summary_path).exists():
+                        logger.info("Loading rollout summary from disk artifact: %s", summary_path)
+                        summary_df = pd.read_csv(summary_path).set_index('policy')
+                    else:
+                        summary_df = pd.DataFrame(payload.get('summary_table', {}))
+                        if not summary_df.empty and 'policy' in summary_df.columns:
+                            summary_df = summary_df.set_index('policy')
+                    raw_eval_path = str(payload.get('raw_eval_path', ''))
+                    episode_summary_path = str(payload.get('episode_summary_path', ''))
+                    loaded_payload = {
+                        'summary_df': summary_df,
+                        'raw_eval_df': None,
+                        'episode_summary_df': None,
+                        'summary_path': summary_path,
+                        'raw_eval_path': raw_eval_path,
+                        'episode_summary_path': episode_summary_path,
+                        'evaluation_signature': eval_signature,
+                        'evaluation_signature_hash': eval_signature.get('signature_hash'),
+                        'cache_manifest': payload.get('cache_manifest', {}),
+                    }
+                    logger.info("Raw rollout trace not cached in memory; loading from artifact on demand.")
+                    return loaded_payload
+                logger.info("Cache miss: %s", reason)
         elif force_recompute:
             logger.info("Force recompute enabled; ignoring cache")
 
@@ -2595,6 +2888,9 @@ class IntegratedSolutionRunner:
             episode_lengths = []
             unsafe_count = 0
             total_steps = 0
+            n_episodes = len(episodes)
+            configured_interval = int(getattr(self.config, 'rollout_progress_every_episodes', 0) or 0)
+            progress_every = configured_interval if configured_interval > 0 else max(1, min(100, n_episodes // 20 if n_episodes >= 20 else n_episodes))
 
             for ep_id, ep in enumerate(episodes):
                 if not ep['states']:
@@ -2645,6 +2941,15 @@ class IntegratedSolutionRunner:
                     'seed': seed,
                     'git_commit': git_commit,
                 })
+                ep_done = ep_id + 1
+                if ep_done % progress_every == 0 or ep_done == n_episodes:
+                    elapsed = time.perf_counter() - t0_policy
+                    rate = ep_done / elapsed if elapsed > 0 else 0.0
+                    eta = ((n_episodes - ep_done) / rate) if rate > 0 else float('inf')
+                    logger.info(
+                        "[policy=%s] rollout progress %s/%s episodes, elapsed=%.1fs, rate=%.2f eps/s, eta=%.1fs",
+                        policy_name, ep_done, n_episodes, elapsed, rate, eta if np.isfinite(eta) else -1.0,
+                    )
 
             if total_steps == 0:
                 raise RuntimeError(f"No rollout steps generated for policy {policy_name}.")
@@ -2683,8 +2988,10 @@ class IntegratedSolutionRunner:
 
         raw_df = pd.DataFrame(raw_rows)
         ep_df = pd.DataFrame(ep_rows)
+        summary_path = self.output_dir / f'{export_prefix}_policy_summary.csv'
         raw_eval_path = self.output_dir / f'{export_prefix}_policy_raw_evaluation.csv'
         episode_summary_path = self.output_dir / f'{export_prefix}_policy_episode_summary.csv'
+        summary_df.reset_index().to_csv(summary_path, index=False)
         raw_df.to_csv(raw_eval_path, index=False)
         ep_df.to_csv(episode_summary_path, index=False)
         logger.info("Completed all baseline evaluations in %.2fs", time.perf_counter() - t0_all)
@@ -2692,15 +2999,30 @@ class IntegratedSolutionRunner:
             'summary_df': summary_df,
             'raw_eval_df': raw_df,
             'episode_summary_df': ep_df,
+            'summary_path': str(summary_path),
             'raw_eval_path': str(raw_eval_path),
             'episode_summary_path': str(episode_summary_path),
+            'evaluation_signature': eval_signature,
+            'evaluation_signature_hash': eval_signature.get('signature_hash'),
         }
         if use_cache:
             try:
-                import pickle
-                with open(cache_file, 'wb') as f:
-                    pickle.dump({'cache_meta': cache_meta, 'rollout_payload': rollout_payload}, f)
-                logger.info("Saved baseline evaluation cache to %s", cache_file)
+                logger.info("Storing lightweight rollout cache manifest")
+                cache_payload = {
+                    'rollout_cache_schema_version': int(self.ROLLOUT_CACHE_SCHEMA_VERSION),
+                    'created_at': datetime.now().isoformat(),
+                    'evaluation_signature': eval_signature,
+                    'summary_table': summary_df.reset_index().to_dict(orient='list'),
+                    'summary_path': str(summary_path),
+                    'raw_eval_path': str(raw_eval_path),
+                    'episode_summary_path': str(episode_summary_path),
+                    'cache_manifest': {
+                        'policy_names': sorted(list(policies.keys())),
+                        'n_eval_transitions': int(len(eval_data)),
+                        'n_eval_episodes': int(len(episodes)),
+                    },
+                }
+                self._save_rollout_cache(cache_file, cache_payload)
             except Exception as e:
                 logger.warning("Failed to save rollout cache to %s: %s", cache_file, e)
         return rollout_payload
