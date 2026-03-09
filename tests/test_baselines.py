@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from pathlib import Path
 import sys
+from dataclasses import dataclass
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -25,6 +26,32 @@ from src.models.baselines import (
     create_random_policy,
     compare_all_baselines
 )
+from src.models.baselines.base_baseline import BaselinePolicy, BaselineMetrics
+
+
+@dataclass
+class _CountingPolicy(BaselinePolicy):
+    eval_calls: int = 0
+
+    def __init__(self, name: str = "counting", state_dim: int = 10):
+        action_space = {'dim': 1, 'low': np.array([0.0]), 'high': np.array([1.0])}
+        super().__init__(name=name, action_space=action_space, state_dim=state_dim)
+        self.eval_calls = 0
+
+    def select_action(self, state: np.ndarray, deterministic: bool = True) -> np.ndarray:
+        return np.array([0.5], dtype=np.float32)
+
+    def evaluate(self, test_data):
+        self.eval_calls += 1
+        rewards = [float(x[2]) for x in test_data]
+        return BaselineMetrics(
+            mean_reward=float(np.mean(rewards)) if rewards else 0.0,
+            safety_violations=0,
+            total_steps=len(test_data),
+            safety_rate=1.0,
+            mean_action_value=0.5,
+            std_action_value=0.0,
+        )
 
 
 # Test fixtures
@@ -449,6 +476,75 @@ def test_full_comparison_workflow(synthetic_data, tmp_path):
     # Verify report files
     assert (tmp_path / "comparison_report.md").exists()
     assert (tmp_path / "comparison_report.json").exists()
+
+
+def test_generate_report_does_not_recompute_when_results_present(synthetic_data, tmp_path, monkeypatch):
+    comparator = BaselineComparator(synthetic_data['test_data'])
+    policy = _CountingPolicy(state_dim=synthetic_data['state_dim'])
+    comparator.add_baseline('counting', policy)
+    comparator.evaluate_all(verbose=False)
+    assert policy.eval_calls == 1
+
+    def _fail_evaluate(*args, **kwargs):
+        raise AssertionError("generate_report should not recompute evaluate_all when cached results exist")
+
+    monkeypatch.setattr(comparator, "evaluate_all", _fail_evaluate)
+    report_path = tmp_path / "cached_report.md"
+    report = comparator.generate_report(output_path=str(report_path))
+    assert "Baseline Policy Comparison Report" in report
+    assert report_path.exists()
+
+
+def test_baseline_cache_reuse_from_disk(synthetic_data, tmp_path):
+    comparator = BaselineComparator(synthetic_data['test_data'])
+    policy = _CountingPolicy(state_dim=synthetic_data['state_dim'])
+    comparator.add_baseline('counting', policy)
+    cache_path = tmp_path / "baseline_eval_cache.json"
+
+    comparator.evaluate_all(verbose=False, cache_path=str(cache_path))
+    assert policy.eval_calls == 1
+
+    # New comparator instance should load cache and avoid policy.evaluate call
+    comparator2 = BaselineComparator(synthetic_data['test_data'])
+    policy2 = _CountingPolicy(state_dim=synthetic_data['state_dim'])
+    comparator2.add_baseline('counting', policy2)
+    comparator2.evaluate_all(verbose=False, cache_path=str(cache_path))
+    assert policy2.eval_calls == 0
+
+
+def test_include_exclude_baseline_selection(synthetic_data):
+    comparator = BaselineComparator(synthetic_data['test_data'])
+    comparator.add_baseline('rule', create_diabetes_rule_policy())
+    comparator.add_baseline('random', create_random_policy(seed=42))
+    comparator.add_baseline('mean', _CountingPolicy(name='mean', state_dim=synthetic_data['state_dim']))
+
+    results = comparator.evaluate_all(
+        verbose=False,
+        include_baselines=['rule', 'random'],
+        exclude_baselines=['random'],
+    )
+    assert list(results.index) == ['rule']
+
+
+def test_fast_eval_subsampling_is_deterministic(synthetic_data):
+    comparator = BaselineComparator(synthetic_data['test_data'])
+    comparator.add_baseline('counting', _CountingPolicy(state_dim=synthetic_data['state_dim']))
+    max_samples = 20
+
+    subset1 = comparator._subsample_test_data(max_eval_samples=max_samples, seed=123)
+    subset2 = comparator._subsample_test_data(max_eval_samples=max_samples, seed=123)
+    assert len(subset1) == max_samples
+    assert len(subset2) == max_samples
+    states1 = np.stack([x[0] for x in subset1], axis=0)
+    states2 = np.stack([x[0] for x in subset2], axis=0)
+    assert np.allclose(states1, states2)
+
+
+def test_unknown_baseline_names_fail_clearly(synthetic_data):
+    comparator = BaselineComparator(synthetic_data['test_data'])
+    comparator.add_baseline('rule', create_diabetes_rule_policy())
+    with pytest.raises(ValueError, match="Unknown baseline names"):
+        comparator.evaluate_all(verbose=False, include_baselines=['does_not_exist'])
 
 
 if __name__ == '__main__':

@@ -25,7 +25,8 @@ import json
 import hashlib
 import subprocess
 import shutil
-from typing import Dict, List, Tuple, Any
+import time
+from typing import Dict, List, Tuple, Any, Optional, Sequence, Set
 
 import numpy as np
 import pandas as pd
@@ -134,6 +135,51 @@ MED_HISTORY_COLS = ['adherence_rate_7d', 'medication_count']
 class IntegratedSolutionRunner:
     """Main class for running the integrated RL healthcare solution."""
 
+    PIPELINE_STAGE_ORDER = [
+        'stage_1_data_preparation',
+        'stage_2_environment_setup',
+        'stage_2b_encoder_training',
+        'stage_3_baseline_training',
+        'stage_4_cql_training',
+        'stage_4b_iql_training',
+        'stage_5_evaluation',
+        'stage_6b_transfer',
+        'stage_7_interpretability',
+        'stage_7b_policy_distillation',
+        'stage_6_report_inputs',
+        'stage_6_generate_reports',
+    ]
+
+    STAGE_CHECKPOINT_KEYS = {
+        'stage_1_data_preparation': ['data'],
+        'stage_2_environment_setup': ['environments'],
+        'stage_2b_encoder_training': ['encoder_wrapper', 'encoded_data'],
+        'stage_3_baseline_training': ['baselines', 'baseline_rollouts'],
+        'stage_4_cql_training': ['cql'],
+        'stage_4b_iql_training': ['iql'],
+        'stage_5_evaluation': ['evaluation'],
+        'stage_6b_transfer': ['transfer'],
+        'stage_7_interpretability': ['interpretability'],
+        'stage_7b_policy_distillation': ['policy_distillation'],
+        'stage_6_report_inputs': ['report_inputs'],
+        'stage_6_generate_reports': ['plot_artifacts', 'master_results'],
+    }
+
+    STAGE_ALIAS = {
+        'stage1': 'stage_1_data_preparation',
+        'stage2': 'stage_2_environment_setup',
+        'stage2b': 'stage_2b_encoder_training',
+        'stage3': 'stage_3_baseline_training',
+        'stage4': 'stage_4_cql_training',
+        'stage4b': 'stage_4b_iql_training',
+        'stage5': 'stage_5_evaluation',
+        'stage6': 'stage_6_generate_reports',
+        'stage6b': 'stage_6b_transfer',
+        'stage7': 'stage_7_interpretability',
+        'stage7b': 'stage_7b_policy_distillation',
+        'report_inputs': 'stage_6_report_inputs',
+    }
+
     def __init__(self, config):
         self.config = config
         seed_all(getattr(config, "seed", 42))
@@ -142,6 +188,10 @@ class IntegratedSolutionRunner:
         self.requested_data_source = self._expected_data_source()
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.pipeline_ckpt_dir = self.output_dir / 'checkpoints' / 'pipeline'
+        self.pipeline_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.pipeline_manifest_path = self.output_dir / 'pipeline_manifest.json'
+        self.pipeline_manifest = self._load_pipeline_manifest()
         self._clear_previous_run_artifacts()
 
         logger.info("=" * 80)
@@ -197,8 +247,234 @@ class IntegratedSolutionRunner:
         self.results.setdefault('plot_artifacts', [])
         self.results['plot_artifacts'].append(str(p))
 
+    def _pipeline_checkpoint_path(self, step_name: str) -> Path:
+        return self.pipeline_ckpt_dir / f"{step_name}.pkl"
+
+    def _normalize_step_name(self, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        canonical = self.STAGE_ALIAS.get(raw.lower(), raw)
+        if canonical not in self.PIPELINE_STAGE_ORDER:
+            raise ValueError(
+                f"Unknown stage/step '{value}'. Allowed: {self.PIPELINE_STAGE_ORDER}"
+            )
+        return canonical
+
+    def _compute_config_hash(self) -> str:
+        cfg = vars(self.config).copy()
+        for volatile in [
+            'resume', 'start_from', 'stop_after',
+            'force_stage', 'invalidate_from',
+        ]:
+            cfg.pop(volatile, None)
+        payload = json.dumps(cfg, sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+    def _compute_dataset_signature(self) -> str:
+        payload = {
+            'mode': getattr(self.config, 'mode', 'unknown'),
+            'use_synthetic': bool(getattr(self.config, 'use_synthetic', False)),
+            'mimic_dir': str(getattr(self.config, 'mimic_dir', '')),
+            'n_synthetic_patients': int(getattr(self.config, 'n_synthetic_patients', 0)),
+            'sample_size': int(getattr(self.config, 'sample_size', 0)),
+            'use_sample': bool(getattr(self.config, 'use_sample', False)),
+            'trajectory_length': int(getattr(self.config, 'trajectory_length', 0)),
+            'batch_size': int(getattr(self.config, 'batch_size', 0)),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode('utf-8')
+        ).hexdigest()
+
+    def _atomic_write_bytes(self, path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + '.tmp')
+        with open(tmp_path, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+
+    def _atomic_write_json(self, path: Path, payload: Dict[str, Any]) -> None:
+        blob = json.dumps(payload, indent=2, default=str).encode('utf-8')
+        self._atomic_write_bytes(path, blob)
+
+    def _load_pipeline_manifest(self) -> Dict[str, Any]:
+        if self.pipeline_manifest_path.exists():
+            try:
+                with open(self.pipeline_manifest_path, 'r') as f:
+                    manifest = json.load(f)
+                manifest.setdefault('stages', {})
+                return manifest
+            except Exception:
+                logger.warning("Failed to parse pipeline manifest; starting fresh.")
+        return {
+            'version': 1,
+            'created_at': datetime.now().isoformat(),
+            'updated_at': datetime.now().isoformat(),
+            'config_hash': self._compute_config_hash() if hasattr(self, 'config') else None,
+            'dataset_signature': None,
+            'git_commit': self._get_git_commit() if hasattr(self, 'config') else "unknown",
+            'stages': {},
+        }
+
+    def _persist_pipeline_manifest(self) -> None:
+        self.pipeline_manifest['updated_at'] = datetime.now().isoformat()
+        self.pipeline_manifest['config_hash'] = self._compute_config_hash()
+        self.pipeline_manifest['dataset_signature'] = self._compute_dataset_signature()
+        self.pipeline_manifest['git_commit'] = self._get_git_commit()
+        self._atomic_write_json(self.pipeline_manifest_path, self.pipeline_manifest)
+
+    def save_checkpoint(self, step_name: str, obj: Any, metadata: Optional[Dict[str, Any]] = None) -> Path:
+        ckpt_path = self._pipeline_checkpoint_path(step_name)
+        meta = {
+            'step_name': step_name,
+            'saved_at': datetime.now().isoformat(),
+            'config_hash': self._compute_config_hash(),
+            'dataset_signature': self._compute_dataset_signature(),
+            'git_commit': self._get_git_commit(),
+        }
+        if metadata:
+            meta.update(metadata)
+        payload = {'meta': meta, 'payload': obj}
+        import pickle
+        self._atomic_write_bytes(ckpt_path, pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
+        logger.info("Saving checkpoint for %s", step_name)
+        stage_entry = self.pipeline_manifest.setdefault('stages', {}).setdefault(step_name, {})
+        stage_entry.update({
+            'status': 'completed',
+            'checkpoint_path': str(ckpt_path),
+            'last_completed_at': datetime.now().isoformat(),
+            'meta': meta,
+        })
+        self._persist_pipeline_manifest()
+        return ckpt_path
+
+    def load_checkpoint(self, step_name: str) -> Optional[Any]:
+        ckpt_path = self._pipeline_checkpoint_path(step_name)
+        if not ckpt_path.exists():
+            return None
+        try:
+            import pickle
+            with open(ckpt_path, 'rb') as f:
+                payload = pickle.load(f)
+            logger.info("Loading checkpoint for %s", step_name)
+            return payload.get('payload')
+        except Exception as e:
+            logger.warning("Checkpoint load failed for %s: %s", step_name, e)
+            return None
+
+    def is_checkpoint_valid(self, step_name: str, config_hash: str, dataset_signature: str) -> bool:
+        ckpt_path = self._pipeline_checkpoint_path(step_name)
+        if not ckpt_path.exists():
+            return False
+        try:
+            import pickle
+            with open(ckpt_path, 'rb') as f:
+                payload = pickle.load(f)
+            meta = payload.get('meta', {})
+            if meta.get('config_hash') != config_hash:
+                return False
+            if meta.get('dataset_signature') != dataset_signature:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _collect_step_artifact_paths(self, step_name: str) -> List[str]:
+        paths: List[str] = []
+        if step_name == 'stage_1_data_preparation':
+            for name in ['synthetic_data.pkl', 'mimic_trajectories.pkl', 'mimic_dataset_summary.json']:
+                p = self.output_dir / name
+                if p.exists():
+                    paths.append(str(p.resolve()))
+        elif step_name == 'stage_3_baseline_training':
+            for name in [
+                'baseline_policy_raw_evaluation.csv',
+                'baseline_policy_episode_summary.csv',
+                'baseline_comparison_report.json',
+            ]:
+                p = self.output_dir / name
+                if p.exists():
+                    paths.append(str(p.resolve()))
+        elif step_name == 'stage_4_cql_training':
+            p = self.output_dir / 'cql'
+            if p.exists():
+                paths.append(str(p.resolve()))
+        elif step_name == 'stage_5_evaluation':
+            for name in ['evaluation_policy_raw_evaluation.csv', 'evaluation_policy_episode_summary.csv', 'ope_estimates.csv', 'safety_summary.csv']:
+                p = self.output_dir / name
+                if p.exists():
+                    paths.append(str(p.resolve()))
+        elif step_name == 'stage_6_generate_reports':
+            for name in ['results_summary.json', 'MASTER_RESULTS.csv', 'RUN_PROVENANCE.json']:
+                p = self.output_dir / name
+                if p.exists():
+                    paths.append(str(p.resolve()))
+        return paths
+
+    def _invalidate_from(self, step_name: str) -> None:
+        idx = self.PIPELINE_STAGE_ORDER.index(step_name)
+        to_clear = self.PIPELINE_STAGE_ORDER[idx:]
+        logger.info("Invalidating downstream checkpoints from %s", step_name)
+        for step in to_clear:
+            ckpt = self._pipeline_checkpoint_path(step)
+            if ckpt.exists():
+                ckpt.unlink()
+            self.pipeline_manifest.setdefault('stages', {}).pop(step, None)
+        self._persist_pipeline_manifest()
+
+    def _execute_pipeline_step(self, step_name: str, fn: Any) -> None:
+        config_hash = self._compute_config_hash()
+        dataset_signature = self._compute_dataset_signature()
+        force_stage_raw = str(getattr(self.config, 'force_stage', '') or '')
+        forced = False
+        if force_stage_raw:
+            force_steps = [self._normalize_step_name(x.strip()) for x in force_stage_raw.split(',') if x.strip()]
+            forced = step_name in force_steps
+
+        can_resume = bool(getattr(self.config, 'resume', False)) and not forced
+        if can_resume and self.is_checkpoint_valid(step_name, config_hash, dataset_signature):
+            loaded = self.load_checkpoint(step_name)
+            if loaded is not None:
+                if isinstance(loaded, dict):
+                    self.results.update(loaded)
+                logger.info("Skipping %s; valid checkpoint found", step_name)
+                stage_entry = self.pipeline_manifest.setdefault('stages', {}).setdefault(step_name, {})
+                stage_entry['status'] = 'completed'
+                stage_entry['last_loaded_at'] = datetime.now().isoformat()
+                self._persist_pipeline_manifest()
+                return
+
+        stage_entry = self.pipeline_manifest.setdefault('stages', {}).setdefault(step_name, {})
+        stage_entry['status'] = 'running'
+        stage_entry['last_started_at'] = datetime.now().isoformat()
+        self._persist_pipeline_manifest()
+
+        try:
+            fn()
+            ckpt_keys = self.STAGE_CHECKPOINT_KEYS.get(step_name, [])
+            payload = {k: self.results[k] for k in ckpt_keys if k in self.results}
+            meta = {
+                'artifact_keys': ckpt_keys,
+                'artifact_paths': self._collect_step_artifact_paths(step_name),
+            }
+            self.save_checkpoint(step_name, payload, metadata=meta)
+        except Exception as e:
+            stage_entry = self.pipeline_manifest.setdefault('stages', {}).setdefault(step_name, {})
+            stage_entry['status'] = 'failed'
+            stage_entry['last_failed_at'] = datetime.now().isoformat()
+            stage_entry['error'] = str(e)
+            self._persist_pipeline_manifest()
+            raise
+
     def _clear_previous_run_artifacts(self) -> None:
         """Prevent stale artifacts from previous runs in reused output dirs."""
+        if bool(getattr(self.config, 'resume', False)):
+            logger.info("Resume mode enabled; preserving existing output artifacts.")
+            return
         stale_files = [
             'synthetic_data.pkl',
             'mimic_trajectories.pkl',
@@ -428,34 +704,39 @@ class IntegratedSolutionRunner:
         if getattr(self.config, "defense_bundle", False):
             return self.run_defense_bundle()
 
-        if self.config.mode in ['full', 'data-only', 'train-eval', 'eval-only', 'synthetic']:
-            self.stage_1_data_preparation()
+        start_from = self._normalize_step_name(getattr(self.config, 'start_from', None))
+        stop_after = self._normalize_step_name(getattr(self.config, 'stop_after', None))
+        invalidate_from = self._normalize_step_name(getattr(self.config, 'invalidate_from', None))
+        if invalidate_from is not None:
+            self._invalidate_from(invalidate_from)
 
-        if self.config.mode in ['full', 'train-eval', 'synthetic']:
-            self.stage_2_environment_setup()
+        stage_plan: List[Tuple[str, bool, Any]] = [
+            ('stage_1_data_preparation', self.config.mode in ['full', 'data-only', 'train-eval', 'eval-only', 'synthetic'], self.stage_1_data_preparation),
+            ('stage_2_environment_setup', self.config.mode in ['full', 'train-eval', 'synthetic'], self.stage_2_environment_setup),
+            ('stage_2b_encoder_training', True, self.stage_2b_encoder_training),
+            ('stage_3_baseline_training', self.config.mode in ['full', 'train-eval', 'synthetic'], self.stage_3_baseline_training),
+            ('stage_4_cql_training', self.config.mode in ['full', 'train-eval'], self.stage_4_cql_training),
+            ('stage_4b_iql_training', True, self.stage_4b_iql_training),
+            ('stage_5_evaluation', self.config.mode in ['full', 'train-eval', 'eval-only', 'synthetic'], self.stage_5_evaluation),
+            ('stage_6b_transfer', True, self.stage_6b_transfer),
+            ('stage_7_interpretability', True, self.stage_7_interpretability),
+            ('stage_7b_policy_distillation', True, self.stage_7b_policy_distillation),
+            ('stage_6_report_inputs', not getattr(self.config, 'no_report', False), self.stage_6_prepare_report_inputs),
+            ('stage_6_generate_reports', not getattr(self.config, 'no_report', False), self.stage_6_generate_reports),
+        ]
 
-        # Encoder pre-training (opt-in)
-        self.stage_2b_encoder_training()
-
-        if self.config.mode in ['full', 'train-eval', 'synthetic']:
-            self.stage_3_baseline_training()
-
-        if self.config.mode in ['full', 'train-eval']:
-            self.stage_4_cql_training()
-
-        self.stage_4b_iql_training()
-
-        if self.config.mode in ['full', 'train-eval', 'eval-only', 'synthetic']:
-            self.stage_5_evaluation()
-
-        # Policy transfer (opt-in)
-        self.stage_6b_transfer()
-
-        # Interpretability (opt-in)
-        self.stage_7_interpretability()
-        self.stage_7b_policy_distillation()
-
-        self.stage_6_generate_reports()
+        started = start_from is None
+        for step_name, enabled, fn in stage_plan:
+            if not enabled:
+                continue
+            if not started:
+                if step_name != start_from:
+                    continue
+                started = True
+            self._execute_pipeline_step(step_name, fn)
+            if stop_after is not None and step_name == stop_after:
+                logger.info("Stopping pipeline after %s due to --stop-after", step_name)
+                break
 
         logger.info("\n" + "=" * 80)
         logger.info("PIPELINE COMPLETE!")
@@ -1143,60 +1424,114 @@ class IntegratedSolutionRunner:
         logger.info(f"Training data: {len(train_data)} transitions")
         logger.info(f"Test data: {len(test_data)} transitions")
 
+        include_baselines = self._parse_name_list(getattr(self.config, 'include_baselines', None))
+        exclude_baselines = self._parse_name_list(getattr(self.config, 'exclude_baselines', None))
+        baseline_order = [
+            'Rule-Based',
+            'Random-Uniform',
+            'Random-Safe',
+            'Mean-Action',
+            'Ridge-Regression',
+            'KNN-5',
+            'Behavior-Cloning',
+        ]
+        selected_names = self._filter_policy_dict(
+            {n: object() for n in baseline_order},
+            include_names=include_baselines,
+            exclude_names=exclude_baselines,
+            skip_slow=bool(getattr(self.config, 'skip_slow_baselines', False)),
+            max_policies=getattr(self.config, 'max_rollout_policies', None),
+        )
+        selected_name_set = set(selected_names.keys())
+
         logger.info("Creating baseline policies...")
         baselines = {}
 
-        logger.info("  1/7 Rule-based policy...")
-        baselines['Rule-Based'] = create_diabetes_rule_policy(state_dim, action_dim)
+        if 'Rule-Based' in selected_name_set:
+            logger.info("  Rule-based policy...")
+            baselines['Rule-Based'] = create_diabetes_rule_policy(state_dim, action_dim)
 
-        logger.info("  2/7 Random policy...")
-        baselines['Random-Uniform'] = create_random_policy(
-            action_dim, state_dim, seed=42, distribution='uniform'
-        )
+        if 'Random-Uniform' in selected_name_set:
+            logger.info("  Random policy...")
+            baselines['Random-Uniform'] = create_random_policy(
+                action_dim, state_dim, seed=42, distribution='uniform'
+            )
 
-        logger.info("  3/7 Safe random policy...")
-        baselines['Random-Safe'] = create_safe_random_policy(
-            action_dim, state_dim, seed=42, num_samples=10
-        )
+        if 'Random-Safe' in selected_name_set:
+            logger.info("  Safe random policy...")
+            baselines['Random-Safe'] = create_safe_random_policy(
+                action_dim, state_dim, seed=42, num_samples=10
+            )
 
-        logger.info("  4/7 Mean action policy...")
-        mean_policy = create_mean_action_policy(action_dim, state_dim)
-        mean_policy.fit(train_states, train_actions)
-        baselines['Mean-Action'] = mean_policy
+        if 'Mean-Action' in selected_name_set:
+            logger.info("  Mean action policy...")
+            mean_policy = create_mean_action_policy(action_dim, state_dim)
+            mean_policy.fit(train_states, train_actions)
+            baselines['Mean-Action'] = mean_policy
 
-        logger.info("  5/7 Ridge regression policy...")
-        ridge_policy = create_regression_policy(
-            state_dim, action_dim, regression_type='ridge', alpha=1.0
-        )
-        ridge_policy.fit(train_states, train_actions)
-        baselines['Ridge-Regression'] = ridge_policy
+        if 'Ridge-Regression' in selected_name_set:
+            logger.info("  Ridge regression policy...")
+            ridge_policy = create_regression_policy(
+                state_dim, action_dim, regression_type='ridge', alpha=1.0
+            )
+            ridge_policy.fit(train_states, train_actions)
+            baselines['Ridge-Regression'] = ridge_policy
 
-        logger.info("  6/7 KNN policy...")
-        knn_policy = create_knn_policy(state_dim, action_dim, k=5)
-        knn_policy.fit(train_states, train_actions)
-        baselines['KNN-5'] = knn_policy
+        if 'KNN-5' in selected_name_set:
+            logger.info("  KNN policy...")
+            knn_policy = create_knn_policy(state_dim, action_dim, k=5)
+            knn_policy.fit(train_states, train_actions)
+            baselines['KNN-5'] = knn_policy
 
-        logger.info("  7/7 Behavior cloning policy...")
-        bc_policy = create_behavior_cloning_policy(
-            state_dim, action_dim, hidden_dims=[64, 64], learning_rate=1e-3
-        )
-
-        val_states = np.array([d[0] for d in data['val']])
-        val_actions = np.array([d[1] for d in data['val']])
-
-        bc_policy.train(
-            train_states, train_actions,
-            val_states, val_actions,
-            epochs=20, batch_size=128, verbose=False
-        )
-        baselines['Behavior-Cloning'] = bc_policy
+        if 'Behavior-Cloning' in selected_name_set:
+            logger.info("  Behavior cloning policy...")
+            bc_policy = create_behavior_cloning_policy(
+                state_dim, action_dim, hidden_dims=[64, 64], learning_rate=1e-3
+            )
+            val_states = np.array([d[0] for d in data['val']])
+            val_actions = np.array([d[1] for d in data['val']])
+            bc_policy.train(
+                train_states, train_actions,
+                val_states, val_actions,
+                epochs=20, batch_size=128, verbose=False
+            )
+            baselines['Behavior-Cloning'] = bc_policy
 
         logger.info("\nEvaluating all baselines with per-policy rollouts...")
+        baselines = self._filter_policy_dict(
+            baselines,
+            include_names=include_baselines,
+            exclude_names=exclude_baselines,
+            skip_slow=bool(getattr(self.config, 'skip_slow_baselines', False)),
+            max_policies=getattr(self.config, 'max_rollout_policies', None),
+        )
+
+        eval_data_for_rollout = test_data
+        fast_eval_enabled = bool(getattr(self.config, 'fast_eval', False))
+        if fast_eval_enabled:
+            max_eval_samples = int(getattr(self.config, 'max_eval_samples', 2000) or 2000)
+            eval_data_for_rollout = self._deterministic_subsample_transitions(
+                test_data, max_eval_samples=max_eval_samples, label='stage_3_baselines',
+            )
+            logger.warning(
+                "Fast eval mode enabled for baseline rollouts. Outputs are for debug/iteration, not final thesis metrics."
+            )
+
         rollout_payload = self._run_policy_rollout_evaluation(
             policies=baselines,
             train_data=train_data,
-            eval_data=test_data,
+            eval_data=eval_data_for_rollout,
             export_prefix='baseline',
+            use_cache=True,
+            force_recompute=bool(getattr(self.config, 'force_recompute_baselines', False)),
+            cache_extra={
+                'fast_eval': fast_eval_enabled,
+                'max_eval_samples': int(getattr(self.config, 'max_eval_samples', 0) or 0),
+                'include_baselines': include_baselines or [],
+                'exclude_baselines': exclude_baselines or [],
+                'skip_slow_baselines': bool(getattr(self.config, 'skip_slow_baselines', False)),
+                'max_rollout_policies': int(getattr(self.config, 'max_rollout_policies', 0) or 0),
+            },
         )
         results_df = rollout_payload['summary_df']
         self._export_baseline_reports(results_df)
@@ -1209,9 +1544,12 @@ class IntegratedSolutionRunner:
         self.results['baselines'] = {
             'policies': baselines,
             'comparison': results_df,
-            'test_data': test_data,
+            'test_data': eval_data_for_rollout,
             'raw_eval_path': rollout_payload['raw_eval_path'],
             'episode_summary_path': rollout_payload['episode_summary_path'],
+            'fast_eval': fast_eval_enabled,
+            'fast_eval_original_test_size': int(len(test_data)),
+            'fast_eval_used_test_size': int(len(eval_data_for_rollout)),
         }
         self.results['baseline_rollouts'] = rollout_payload
         logger.info("Baseline training complete")
@@ -1407,12 +1745,31 @@ class IntegratedSolutionRunner:
             eval_policies['IQL'] = self.results['iql']['agent']
 
         # Per-policy rollouts used as source of truth for reward/safety summaries.
-        rollout_eval = self._run_policy_rollout_evaluation(
-            policies=eval_policies,
-            train_data=train_data,
-            eval_data=test_data,
-            export_prefix='evaluation',
-        )
+        # Reuse Stage 3 baseline rollout results when policy set is identical.
+        baseline_rollout = self.results.get('baseline_rollouts')
+        baseline_policy_names = set(self.results.get('baselines', {}).get('policies', {}).keys())
+        eval_policy_names = set(eval_policies.keys())
+        if (
+            baseline_rollout is not None
+            and eval_policy_names == baseline_policy_names
+            and len(test_data) == int(self.results.get('baselines', {}).get('fast_eval_used_test_size', len(test_data)))
+        ):
+            logger.info("Using cached baseline evaluation results from Stage 3 rollouts")
+            rollout_eval = baseline_rollout
+        else:
+            rollout_eval = self._run_policy_rollout_evaluation(
+                policies=eval_policies,
+                train_data=train_data,
+                eval_data=test_data,
+                export_prefix='evaluation',
+                use_cache=True,
+                force_recompute=bool(getattr(self.config, 'force_recompute_baselines', False)),
+                cache_extra={
+                    'fast_eval': bool(getattr(self.config, 'fast_eval', False)),
+                    'max_eval_samples': int(getattr(self.config, 'max_eval_samples', 0) or 0),
+                    'policy_set': sorted(list(eval_policy_names)),
+                },
+            )
         summary_df = rollout_eval['summary_df']
 
         # Off-policy evaluation
@@ -1784,6 +2141,9 @@ class IntegratedSolutionRunner:
             'mode': self.config.mode,
             'data_source': self.results.get('data', {}).get('source', 'unknown'),
             'baselines_evaluated': list(self.results.get('baselines', {}).get('policies', {}).keys()),
+            'fast_eval': bool(getattr(self.config, 'fast_eval', False)),
+            'max_eval_samples': int(getattr(self.config, 'max_eval_samples', 0) or 0),
+            'skip_slow_baselines': bool(getattr(self.config, 'skip_slow_baselines', False)),
             'output_directory': str(self.output_dir),
             'dataset_identity': {
                 'data_source': self.results.get('data', {}).get('source', 'unknown'),
@@ -1844,7 +2204,10 @@ class IntegratedSolutionRunner:
         self._generate_latex_table()
         self._generate_master_results()
         self._write_limitations_file()
-        if not getattr(self.config, 'demo', False) and not getattr(self.config, 'defense_bundle', False):
+        if getattr(self.config, 'light_report', False):
+            self.results['plot_artifacts'] = []
+            logger.info("Light report enabled: skipping heavy visualization generation.")
+        elif not getattr(self.config, 'demo', False) and not getattr(self.config, 'defense_bundle', False):
             self._generate_visualizations()
         else:
             self.results['plot_artifacts'] = []
@@ -1852,6 +2215,18 @@ class IntegratedSolutionRunner:
         self._run_artifact_validation()
 
         logger.info("Report generation complete")
+
+    def stage_6_prepare_report_inputs(self):
+        """Capture report-input summary payload for resumable reporting."""
+        payload = {
+            'timestamp': datetime.now().isoformat(),
+            'mode': self.config.mode,
+            'data_source': self.results.get('data', {}).get('source', 'unknown'),
+            'n_baselines': len(self.results.get('baselines', {}).get('policies', {})),
+            'has_evaluation': 'evaluation' in self.results,
+            'output_directory': str(self.output_dir),
+        }
+        self.results['report_inputs'] = payload
 
     # ------------------------------------------------------------------
     # Stage 6b  (opt-in)
@@ -2060,14 +2435,139 @@ class IntegratedSolutionRunner:
         rounded = np.asarray(state, dtype=np.float32).round(4)
         return hashlib.md5(rounded.tobytes()).hexdigest()[:12]
 
+    def _known_baseline_names(self) -> Set[str]:
+        return {
+            'Rule-Based',
+            'Random-Uniform',
+            'Random-Safe',
+            'Mean-Action',
+            'Ridge-Regression',
+            'KNN-5',
+            'Behavior-Cloning',
+        }
+
+    @staticmethod
+    def _parse_name_list(raw: Optional[str]) -> Optional[List[str]]:
+        if raw is None:
+            return None
+        names = [x.strip() for x in str(raw).split(',') if x.strip()]
+        return names if names else None
+
+    def _filter_policy_dict(
+        self,
+        policies: Dict[str, Any],
+        include_names: Optional[Sequence[str]] = None,
+        exclude_names: Optional[Sequence[str]] = None,
+        skip_slow: bool = False,
+        max_policies: Optional[int] = None,
+        slow_names: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        selected = list(policies.keys())
+        all_names = set(selected)
+
+        if include_names:
+            unknown = sorted(set(include_names) - all_names)
+            if unknown:
+                raise ValueError(f"Unknown baseline names in --include-baselines: {unknown}")
+            include_set = set(include_names)
+            selected = [n for n in selected if n in include_set]
+
+        if exclude_names:
+            unknown = sorted(set(exclude_names) - all_names)
+            if unknown:
+                raise ValueError(f"Unknown baseline names in --exclude-baselines: {unknown}")
+            exclude_set = set(exclude_names)
+            selected = [n for n in selected if n not in exclude_set]
+
+        if skip_slow:
+            slow = set(slow_names or ['KNN-5', 'Behavior-Cloning'])
+            selected = [n for n in selected if n not in slow]
+
+        if max_policies is not None and max_policies > 0:
+            selected = selected[:max_policies]
+
+        if not selected:
+            raise ValueError("No baselines selected after include/exclude/skip filtering.")
+
+        logger.info("Final baseline policy set (%s): %s", len(selected), selected)
+        return {n: policies[n] for n in selected}
+
+    def _deterministic_subsample_transitions(
+        self,
+        transitions: List[Tuple],
+        max_samples: Optional[int],
+        label: str,
+    ) -> List[Tuple]:
+        if max_samples is None or max_samples <= 0 or len(transitions) <= max_samples:
+            return transitions
+        seed = int(getattr(self.config, 'seed', 42))
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.choice(len(transitions), size=max_samples, replace=False))
+        sampled = [transitions[int(i)] for i in idx]
+        logger.info(
+            "Fast eval sampling for %s: %s -> %s transitions (seed=%s).",
+            label,
+            len(transitions),
+            len(sampled),
+            seed,
+        )
+        return sampled
+
+    def _transitions_signature(self, transitions: List[Tuple], limit: int = 128) -> str:
+        h = hashlib.sha256()
+        h.update(str(len(transitions)).encode('utf-8'))
+        max_n = min(len(transitions), max(1, limit))
+        for i in range(max_n):
+            s, a, r, ns, d = transitions[i]
+            s_arr = np.asarray(s, dtype=np.float32).reshape(-1)
+            a_arr = np.asarray(a, dtype=np.float32).reshape(-1)
+            ns_arr = np.asarray(ns, dtype=np.float32).reshape(-1)
+            h.update(s_arr[:16].round(5).tobytes())
+            h.update(a_arr[:4].round(5).tobytes())
+            h.update(np.asarray([float(r), float(d)], dtype=np.float32).tobytes())
+            h.update(ns_arr[:16].round(5).tobytes())
+        return h.hexdigest()
+
+    def _rollout_cache_path(self, export_prefix: str) -> Path:
+        return self.output_dir / f"{export_prefix}_rollout_cache.pkl"
+
     def _run_policy_rollout_evaluation(
         self,
         policies: Dict[str, Any],
         train_data: List[Tuple],
         eval_data: List[Tuple],
         export_prefix: str,
+        use_cache: bool = True,
+        force_recompute: bool = False,
+        cache_extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Evaluate each policy with independent model-based rollouts and export raw traces."""
+        cache_file = self._rollout_cache_path(export_prefix)
+        cache_meta = {
+            'policy_names': list(policies.keys()),
+            'train_signature': self._transitions_signature(train_data),
+            'eval_signature': self._transitions_signature(eval_data),
+            'export_prefix': export_prefix,
+            'seed': int(getattr(self.config, 'seed', 42)),
+        }
+        if cache_extra:
+            cache_meta.update(cache_extra)
+
+        if use_cache and cache_file.exists() and not force_recompute:
+            try:
+                import pickle
+                with open(cache_file, 'rb') as f:
+                    payload = pickle.load(f)
+                if payload.get('cache_meta') == cache_meta:
+                    logger.info("Found cached baseline evaluation results at %s", cache_file)
+                    logger.info("Reusing cached results for %s baselines", len(policies))
+                    return payload['rollout_payload']
+                logger.info("Cache miss: evaluation parameters changed")
+            except Exception as e:
+                logger.warning("Failed to load rollout cache from %s: %s", cache_file, e)
+        elif force_recompute:
+            logger.info("Force recompute enabled; ignoring cache")
+
         sim_model = self._fit_linear_simulator(train_data)
         episodes = self._transitions_to_episodes(eval_data)
         safety_cfg = EvaluationConfig().safety
@@ -2076,8 +2576,20 @@ class IntegratedSolutionRunner:
         ep_rows = []
         summary_rows = []
         action_signatures: Dict[str, str] = {}
+        data_source = self.results.get('data', {}).get('source', 'unknown')
+        seed = int(getattr(self.config, 'seed', 42))
+        git_commit = self._get_git_commit()
+        t0_all = time.perf_counter()
+        logger.info(
+            "Baseline rollout evaluation start: baselines=%s episodes=%s transitions=%s",
+            len(policies),
+            len(episodes),
+            len(eval_data),
+        )
 
         for policy_name, policy in policies.items():
+            t0_policy = time.perf_counter()
+            logger.info("Evaluating baseline: %s (samples=%s)", policy_name, len(eval_data))
             per_policy_actions = []
             episode_returns = []
             episode_lengths = []
@@ -2089,6 +2601,7 @@ class IntegratedSolutionRunner:
                     continue
                 state = np.asarray(ep['states'][0], dtype=np.float32).reshape(-1)
                 ep_return = 0.0
+                ep_unsafe_count = 0
 
                 for step_id in range(len(ep['states'])):
                     raw_action, clipped_action = self._safe_policy_action(policy, state)
@@ -2098,6 +2611,7 @@ class IntegratedSolutionRunner:
                     done = step_id == (len(ep['states']) - 1)
                     constraint_satisfied = not unsafe
                     unsafe_count += int(unsafe)
+                    ep_unsafe_count += int(unsafe)
                     total_steps += 1
                     per_policy_actions.append(clipped_action)
                     ep_return += reward
@@ -2113,9 +2627,9 @@ class IntegratedSolutionRunner:
                         'done': done,
                         'unsafe_flag': unsafe,
                         'constraint_satisfied_flag': constraint_satisfied,
-                        'data_source': self.results.get('data', {}).get('source', 'unknown'),
-                        'seed': int(getattr(self.config, 'seed', 42)),
-                        'git_commit': self._get_git_commit(),
+                        'data_source': data_source,
+                        'seed': seed,
+                        'git_commit': git_commit,
                     })
                     state = next_state
 
@@ -2126,12 +2640,10 @@ class IntegratedSolutionRunner:
                     'episode_id': ep_id,
                     'episode_return': ep_return,
                     'episode_length': len(ep['states']),
-                    'unsafe_steps': int(np.sum(
-                        [r['unsafe_flag'] for r in raw_rows if r['policy_name'] == policy_name and r['episode_id'] == ep_id]
-                    )),
-                    'data_source': self.results.get('data', {}).get('source', 'unknown'),
-                    'seed': int(getattr(self.config, 'seed', 42)),
-                    'git_commit': self._get_git_commit(),
+                    'unsafe_steps': int(ep_unsafe_count),
+                    'data_source': data_source,
+                    'seed': seed,
+                    'git_commit': git_commit,
                 })
 
             if total_steps == 0:
@@ -2153,6 +2665,7 @@ class IntegratedSolutionRunner:
                 'mean_action_value': float(np.mean(per_policy_actions)),
                 'std_action_value': float(np.std(per_policy_actions)),
             })
+            logger.info("Completed baseline: %s in %.2fs", policy_name, time.perf_counter() - t0_policy)
 
         sig_groups: Dict[str, List[str]] = {}
         for p, sig in action_signatures.items():
@@ -2174,13 +2687,23 @@ class IntegratedSolutionRunner:
         episode_summary_path = self.output_dir / f'{export_prefix}_policy_episode_summary.csv'
         raw_df.to_csv(raw_eval_path, index=False)
         ep_df.to_csv(episode_summary_path, index=False)
-        return {
+        logger.info("Completed all baseline evaluations in %.2fs", time.perf_counter() - t0_all)
+        rollout_payload = {
             'summary_df': summary_df,
             'raw_eval_df': raw_df,
             'episode_summary_df': ep_df,
             'raw_eval_path': str(raw_eval_path),
             'episode_summary_path': str(episode_summary_path),
         }
+        if use_cache:
+            try:
+                import pickle
+                with open(cache_file, 'wb') as f:
+                    pickle.dump({'cache_meta': cache_meta, 'rollout_payload': rollout_payload}, f)
+                logger.info("Saved baseline evaluation cache to %s", cache_file)
+            except Exception as e:
+                logger.warning("Failed to save rollout cache to %s: %s", cache_file, e)
+        return rollout_payload
 
     def _export_baseline_reports(self, summary_df: pd.DataFrame) -> None:
         required_cols = [
@@ -3142,10 +3665,36 @@ def parse_arguments():
                         help='Patient batch size for MIMIC feature preparation')
     parser.add_argument('--resume', action='store_true',
                         help='Resume MIMIC preparation from existing checkpoints when available')
+    parser.add_argument('--start-from', type=str, default=None,
+                        help='Start pipeline from this stage/step (e.g., stage_3_baseline_training)')
+    parser.add_argument('--stop-after', type=str, default=None,
+                        help='Stop pipeline after this stage/step')
+    parser.add_argument('--force-stage', type=str, default=None,
+                        help='Comma-separated stage/step names to force recompute even if checkpoint exists')
+    parser.add_argument('--invalidate-from', type=str, default=None,
+                        help='Invalidate checkpoints from this stage/step onward before run')
     parser.add_argument('--ignore-checkpoints', action='store_true',
                         help='Ignore all existing checkpoints and recompute from scratch')
     parser.add_argument('--checkpoint-dir', type=str, default=None,
                         help='Directory for stage/batch checkpoints (default: <output-dir>/checkpoints/mimic)')
+    parser.add_argument('--fast-eval', action='store_true',
+                        help='Fast local evaluation mode (deterministic subsampling for quicker debug runs)')
+    parser.add_argument('--max-eval-samples', type=int, default=2000,
+                        help='Maximum number of evaluation transitions when --fast-eval is enabled')
+    parser.add_argument('--max-rollout-policies', type=int, default=None,
+                        help='Optional cap on number of baselines/policies evaluated in rollout mode')
+    parser.add_argument('--include-baselines', type=str, default=None,
+                        help='Comma-separated baseline names to include (e.g., Rule-Based,Mean-Action)')
+    parser.add_argument('--exclude-baselines', type=str, default=None,
+                        help='Comma-separated baseline names to exclude')
+    parser.add_argument('--skip-slow-baselines', action='store_true',
+                        help='Skip known slow baselines (KNN-5, Behavior-Cloning) for debug runs')
+    parser.add_argument('--force-recompute-baselines', action='store_true',
+                        help='Ignore baseline rollout cache and recompute baseline evaluations')
+    parser.add_argument('--no-report', action='store_true',
+                        help='Skip final report generation stage (faster local iteration)')
+    parser.add_argument('--light-report', action='store_true',
+                        help='Generate summary files but skip heavy visualization generation')
     parser.add_argument('--disable-missingness-masks', action='store_true',
                         help='Disable explicit missingness mask features in MIMIC preprocessing')
     parser.add_argument('--enable-time-since-last-observed', action='store_true',
@@ -3236,6 +3785,21 @@ def main():
         args.train_iql = True
         args.train_cql = False
         args.output_dir = args.output_dir or 'outputs/demo'
+
+    def _parse_csv(raw: Optional[str]) -> List[str]:
+        if raw is None:
+            return []
+        return [x.strip() for x in str(raw).split(',') if x.strip()]
+
+    known = {
+        'Rule-Based', 'Random-Uniform', 'Random-Safe',
+        'Mean-Action', 'Ridge-Regression', 'KNN-5', 'Behavior-Cloning',
+    }
+    requested = set(_parse_csv(args.include_baselines)) | set(_parse_csv(args.exclude_baselines))
+    unknown = sorted(requested - known)
+    if unknown:
+        raise ValueError(f"Unknown baseline names requested: {unknown}. Known names: {sorted(known)}")
+
     runner = IntegratedSolutionRunner(args)
 
     try:
