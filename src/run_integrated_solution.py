@@ -196,6 +196,10 @@ class IntegratedSolutionRunner:
         'stage7b': 'stage_7b_policy_distillation',
         'report_inputs': 'stage_6_report_inputs',
     }
+    STAGES_ALWAYS_REBUILD_ON_RESUME = {
+        # Baseline policies include closures/rule functions; recreate from stage logic.
+        'stage_3_baseline_training',
+    }
 
     def __init__(self, config):
         self.config = config
@@ -376,7 +380,17 @@ class IntegratedSolutionRunner:
             meta.update(metadata)
         payload = {'meta': meta, 'payload': obj}
         import pickle
-        self._atomic_write_bytes(ckpt_path, pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
+        try:
+            blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            logger.warning(
+                "Non-serializable object detected in checkpoint payload for %s. "
+                "Sanitizing payload before saving checkpoint. (%s)",
+                step_name, e,
+            )
+            payload = {'meta': meta, 'payload': self._sanitize_checkpoint_payload(obj)}
+            blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+        self._atomic_write_bytes(ckpt_path, blob)
         logger.info("Saving checkpoint for %s", step_name)
         stage_entry = self.pipeline_manifest.setdefault('stages', {}).setdefault(step_name, {})
         stage_entry.update({
@@ -471,6 +485,65 @@ class IntegratedSolutionRunner:
                     paths.append(str(p.resolve()))
         return paths
 
+    def _build_stage_checkpoint_payload(self, step_name: str) -> Dict[str, Any]:
+        """Build stage payload while excluding runtime-only/non-serializable objects."""
+        ckpt_keys = self.STAGE_CHECKPOINT_KEYS.get(step_name, [])
+        payload = {k: self.results[k] for k in ckpt_keys if k in self.results}
+
+        if step_name == 'stage_3_baseline_training':
+            baselines = payload.get('baselines')
+            if isinstance(baselines, dict):
+                # Do not checkpoint policy objects; they may contain local closures.
+                policies = baselines.get('policies', {})
+                slim = {k: v for k, v in baselines.items() if k != 'policies'}
+                slim['baseline_names'] = list(policies.keys()) if isinstance(policies, dict) else []
+                payload['baselines'] = slim
+            rollout = payload.get('baseline_rollouts')
+            if isinstance(rollout, dict):
+                slim_rollout = {k: v for k, v in rollout.items() if k not in ('raw_eval_df', 'episode_summary_df')}
+                payload['baseline_rollouts'] = slim_rollout
+
+        return payload
+
+    def _sanitize_checkpoint_payload(self, obj: Any) -> Any:
+        """Recursively sanitize non-pickleable objects in checkpoint payloads."""
+        import pickle
+        import types
+
+        if isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, pd.Series):
+            return obj.to_dict()
+        if isinstance(obj, pd.DataFrame):
+            return obj
+        if isinstance(obj, dict):
+            out: Dict[str, Any] = {}
+            for k, v in obj.items():
+                if k == 'policies' and isinstance(v, dict):
+                    out['baseline_names'] = list(v.keys())
+                    continue
+                out[k] = self._sanitize_checkpoint_payload(v)
+            return out
+        if isinstance(obj, (list, tuple, set)):
+            seq = [self._sanitize_checkpoint_payload(x) for x in obj]
+            return seq if isinstance(obj, list) else tuple(seq)
+        if isinstance(obj, (types.FunctionType, types.MethodType, types.BuiltinFunctionType)):
+            return f"<non-serializable:{type(obj).__module__}.{type(obj).__name__}>"
+        if callable(obj):
+            return f"<non-serializable-callable:{type(obj).__module__}.{type(obj).__name__}>"
+
+        try:
+            pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+            return obj
+        except Exception:
+            return f"<non-serializable:{type(obj).__module__}.{type(obj).__name__}>"
+
     def _invalidate_from(self, step_name: str) -> None:
         idx = self.PIPELINE_STAGE_ORDER.index(step_name)
         to_clear = self.PIPELINE_STAGE_ORDER[idx:]
@@ -492,6 +565,12 @@ class IntegratedSolutionRunner:
             forced = step_name in force_steps
 
         can_resume = bool(getattr(self.config, 'resume', False)) and not forced
+        if can_resume and step_name in self.STAGES_ALWAYS_REBUILD_ON_RESUME:
+            logger.info(
+                "Stage %s will be recomputed on resume to reconstruct runtime objects (e.g., policies).",
+                step_name,
+            )
+            can_resume = False
         if can_resume:
             if self.is_checkpoint_valid(step_name, config_hash, dataset_signature):
                 loaded = self.load_checkpoint(step_name)
@@ -514,10 +593,9 @@ class IntegratedSolutionRunner:
 
         try:
             fn()
-            ckpt_keys = self.STAGE_CHECKPOINT_KEYS.get(step_name, [])
-            payload = {k: self.results[k] for k in ckpt_keys if k in self.results}
+            payload = self._build_stage_checkpoint_payload(step_name)
             meta = {
-                'artifact_keys': ckpt_keys,
+                'artifact_keys': list(payload.keys()),
                 'artifact_paths': self._collect_step_artifact_paths(step_name),
             }
             self.save_checkpoint(step_name, payload, metadata=meta)
@@ -2619,9 +2697,13 @@ class IntegratedSolutionRunner:
     def _deterministic_subsample_transitions(
         self,
         transitions: List[Tuple],
-        max_samples: Optional[int],
-        label: str,
+        max_samples: Optional[int] = None,
+        label: str = "",
+        max_eval_samples: Optional[int] = None,
     ) -> List[Tuple]:
+        # Backward-compatible alias support: callers may pass max_eval_samples.
+        if max_samples is None:
+            max_samples = max_eval_samples
         if max_samples is None or max_samples <= 0 or len(transitions) <= max_samples:
             return transitions
         seed = int(getattr(self.config, 'seed', 42))

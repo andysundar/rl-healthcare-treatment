@@ -85,7 +85,8 @@ def test_resume_skips_completed_checkpoints(tmp_path):
     runner2.run_full_pipeline()
 
     assert 'stage_1_data_preparation' not in events2
-    assert 'stage_3_baseline_training' not in events2
+    # Stage 3 intentionally rebuilds policies on resume (runtime objects not loaded from checkpoint).
+    assert 'stage_3_baseline_training' in events2
     assert 'stage_5_evaluation' in events2
 
 

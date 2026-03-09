@@ -165,7 +165,12 @@ check_runtime_deps() {
   dep_check="$($PYTHON_BIN - <<'PY'
 import importlib
 mods = ["numpy", "pandas", "torch", "matplotlib", "sklearn"]
-missing = [m for m in mods if importlib.util.find_spec(m) is None]
+missing = []
+for m in mods:
+    try:
+        importlib.import_module(m)
+    except Exception:
+        missing.append(m)
 print(",".join(missing))
 PY
 )"
@@ -247,8 +252,13 @@ resolve_mimic_dir() {
 
 print_scenario_summary() {
   local scenario="$1"
-  local out_dir="$2"
+  local requested_out_dir="$2"
+  local out_dir
+  out_dir="$(resolve_output_dir "$requested_out_dir")"
   section "Scenario Complete: $scenario"
+  if [[ "$out_dir" != "$requested_out_dir" ]]; then
+    info "Requested output dir: $requested_out_dir"
+  fi
   info "Output dir: $out_dir"
   info "Checkpoint dir: $out_dir/checkpoints"
 
@@ -266,8 +276,26 @@ print_scenario_summary() {
   fi
 }
 
+resolve_output_dir() {
+  local requested="$1"
+  if [[ -d "$requested" ]]; then
+    echo "$requested"
+    return
+  fi
+  if [[ -d "${requested}_synthetic" ]]; then
+    echo "${requested}_synthetic"
+    return
+  fi
+  if [[ -d "${requested}_mimic" ]]; then
+    echo "${requested}_mimic"
+    return
+  fi
+  echo "$requested"
+}
+
 validate_smoke_outputs() {
-  local out_dir="$1"
+  local out_dir
+  out_dir="$(resolve_output_dir "$1")"
   require_path "$out_dir" "Smoke output directory" || exit 1
   require_path "$out_dir/checkpoints" "Smoke checkpoint directory" || exit 1
   require_path "$out_dir/RUN_PROVENANCE.json" "Smoke provenance file" || exit 1
@@ -275,7 +303,7 @@ validate_smoke_outputs() {
 }
 
 run_smoke() {
-  local out_dir="outputs/smoke_test"
+  local requested_out_dir="outputs/smoke_test_synthetic"
   section "Scenario: smoke"
   run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
     --mode train-eval \
@@ -286,18 +314,20 @@ run_smoke() {
     --max-eval-samples 200 \
     --skip-slow-baselines \
     --light-report \
-    --output-dir "$out_dir"
+    --output-dir "$requested_out_dir"
 
-  validate_smoke_outputs "$out_dir"
-  print_scenario_summary "smoke" "$out_dir"
+  validate_smoke_outputs "$requested_out_dir"
+  print_scenario_summary "smoke" "$requested_out_dir"
 }
 
 run_resume_check() {
-  local out_dir="outputs/smoke_test"
+  local requested_out_dir="outputs/smoke_test_synthetic"
   section "Scenario: resume-check"
   info "Step 1/2: initial smoke run"
   run_smoke
 
+  local out_dir
+  out_dir="$(resolve_output_dir "$requested_out_dir")"
   info "Step 2/2: rerun smoke with --resume"
   run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
     --mode train-eval \
@@ -313,11 +343,11 @@ run_resume_check() {
 
   validate_smoke_outputs "$out_dir"
   status "Resume path exercised successfully"
-  print_scenario_summary "resume-check" "$out_dir"
+  print_scenario_summary "resume-check" "$requested_out_dir"
 }
 
 run_synthetic_fast() {
-  local out_dir="outputs/synthetic_fast"
+  local out_dir="outputs/synthetic_fast_synthetic"
   section "Scenario: synthetic-fast"
   run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
     --mode train-eval \
@@ -333,7 +363,7 @@ run_synthetic_fast() {
 }
 
 run_synthetic_medium() {
-  local out_dir="outputs/synthetic_medium"
+  local out_dir="outputs/synthetic_medium_synthetic"
   section "Scenario: synthetic-medium"
   run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
     --mode train-eval \
@@ -353,7 +383,7 @@ run_synthetic_medium() {
 }
 
 run_synthetic_full() {
-  local out_dir="outputs/synthetic_full"
+  local out_dir="outputs/synthetic_full_synthetic"
   section "Scenario: synthetic-full"
   run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
     --mode train-eval \
@@ -377,7 +407,7 @@ run_synthetic_full() {
 }
 
 run_synthetic_cql() {
-  local out_dir="outputs/cql_only"
+  local out_dir="outputs/cql_only_synthetic"
   section "Scenario: synthetic-cql"
   run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
     --mode train-eval \
@@ -392,7 +422,7 @@ run_synthetic_cql() {
 }
 
 run_synthetic_encoder_cql() {
-  local out_dir="outputs/enc_cql"
+  local out_dir="outputs/enc_cql_synthetic"
   section "Scenario: synthetic-encoder-cql"
   run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
     --mode train-eval \
@@ -410,7 +440,7 @@ run_synthetic_encoder_cql() {
 }
 
 run_synthetic_extended_state() {
-  local out_dir="outputs/extended_state"
+  local out_dir="outputs/extended_state_synthetic"
   section "Scenario: synthetic-extended-state"
   run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
     --mode train-eval \
