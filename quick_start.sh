@@ -1,315 +1,577 @@
-#!/bin/bash
-# Quick Start Script — RL Healthcare Treatment Project
-# Author: Anindya Bandopadhyay (M23CSA508)
-#
+#!/usr/bin/env bash
+# Robust scenario runner for RL Healthcare Treatment Project
 # Usage:
-#   ./quick_start.sh              # interactive scenario menu
-#   ./quick_start.sh --mode N     # run scenario N directly (N = 1-8)
-#   ./quick_start.sh --help       # print scenario descriptions
+#   ./quick_start.sh
+#   ./quick_start.sh --mode smoke
+#   ./quick_start.sh --mode 1
+#   ./quick_start.sh --mode mimic-full --mimic-dir /path/to/mimic
+#   ./quick_start.sh --install-deps --mode synthetic-fast
 
-set -e
+set -euo pipefail
 
-# ── Colours ───────────────────────────────────────────────────────────────────
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-print_status()  { echo -e "${GREEN}✓${NC} $1"; }
-print_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
-print_error()   { echo -e "${RED}✗${NC} $1"; }
-print_info()    { echo -e "${BLUE}ℹ${NC} $1"; }
-
-echo "=========================================="
-echo " RL Healthcare Treatment — Quick Start"
-echo "=========================================="
-echo ""
-
-# ── Sanity checks ─────────────────────────────────────────────────────────────
-if [ ! -f "src/run_integrated_solution.py" ]; then
-    print_error "Run this script from the project root directory"
-    exit 1
-fi
-
-python_ver=$(python3 --version 2>&1 | awk '{print $2}')
-print_status "Python $python_ver"
-
-# ── Install dependencies ───────────────────────────────────────────────────────
-echo ""
-echo "Installing dependencies..."
-pip install -r requirements.txt --break-system-packages --quiet
-print_status "Dependencies installed"
-
-# ── Device check ──────────────────────────────────────────────────────────────
-echo ""
-python3 -c "
-import torch
-if torch.backends.mps.is_available():
-    print('✓ MPS (Apple Silicon GPU) available')
-elif torch.cuda.is_available():
-    print('✓ CUDA GPU available')
-else:
-    print('⚠  CPU only — training will be slower')
-"
-
-# ── Parse --mode / --help arguments ──────────────────────────────────────────
-CHOICE=""
-
-if [ "$1" = "--mode" ] && [ -n "$2" ]; then
-    CHOICE="$2"
-elif [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-    echo ""
-    echo "Usage:  ./quick_start.sh [--mode N]"
-    echo ""
-    echo "Synthetic data scenarios (no MIMIC-III required)"
-    echo "  1  Quick demo          baseline comparison only                  (<2 min)"
-    echo "  2  Baseline + CQL      adds real offline CQL training            (~10 min)"
-    echo "  3  Encoder + CQL       adds state autoencoder pre-training       (~20 min)"
-    echo "  4  Extended state      vitals + med-history (16-dim state)       (~20 min)"
-    echo "  5  Full pipeline       encoder + CQL + interpretability + transfer (~60 min)"
-    echo "  8  Defense bundle      complete thesis-defense artifact bundle     (~2-5 min)"
-    echo ""
-    echo "MIMIC-III scenarios (credentialed PhysioNet access required)"
-    echo "  6  MIMIC sample        100-patient cohort, CQL training          (~30 min)"
-    echo "  7  MIMIC full          complete pipeline incl. vitals if available (hours)"
-    echo ""
-    echo "Required MIMIC-III files (base run): PATIENTS.csv, ADMISSIONS.csv,"
-    echo "  DIAGNOSES_ICD.csv, LABEVENTS.csv, PRESCRIPTIONS.csv"
-    echo "Optional (for --use-vitals):         CHARTEVENTS.csv"
-    echo ""
-    echo "See docs/MIMIC_DOWNLOAD_GUIDE.md for download instructions."
-    exit 0
-fi
-
-# ── Interactive menu ───────────────────────────────────────────────────────────
-if [ -z "$CHOICE" ]; then
-    echo ""
-    echo "=========================================="
-    echo "Select a run scenario:"
-    echo "=========================================="
-    echo ""
-    echo "  Synthetic data (no MIMIC-III required)"
-    echo "  ──────────────────────────────────────────────────────────────"
-    echo "  1) Quick demo          baseline comparison only           (<2 min)"
-    echo "  2) Baseline + CQL      adds real CQL training             (~10 min)"
-    echo "  3) Encoder + CQL       adds state autoencoder             (~20 min)"
-    echo "  4) Extended state      vitals + med-history (16-dim)      (~20 min)"
-    echo "  5) Full pipeline       encoder+CQL+interp+transfer        (~60 min)"
-    echo ""
-    echo "  MIMIC-III data (PhysioNet credentialed access required)"
-    echo "  ──────────────────────────────────────────────────────────────"
-    echo "  6) MIMIC sample        100-patient cohort                 (~30 min)"
-    echo "  7) MIMIC full          complete pipeline w/ vitals        (hours)"
-    echo "  8) Defense bundle      full evidence/report artifact run  (~2-5 min)"
-    echo ""
-    read -p "Enter choice (1-8): " CHOICE
-fi
-
-# ── Helper: verify MIMIC-III directory ────────────────────────────────────────
-check_mimic_dir() {
-    local dir="$1"
-    if [ ! -d "$dir" ]; then
-        print_error "Directory not found: $dir"
-        exit 1
-    fi
-    local missing=""
-    for f in PATIENTS.csv ADMISSIONS.csv DIAGNOSES_ICD.csv LABEVENTS.csv PRESCRIPTIONS.csv; do
-        [ ! -f "$dir/$f" ] && missing="$missing  $f"
-    done
-    if [ -n "$missing" ]; then
-        print_error "Missing required MIMIC-III files in $dir:"
-        echo "$missing"
-        print_info "See docs/MIMIC_DOWNLOAD_GUIDE.md for download instructions"
-        exit 1
-    fi
-    print_status "All required MIMIC-III files found"
+status()  { echo -e "${GREEN}[OK]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
+err()     { echo -e "${RED}[ERR]${NC} $*"; }
+info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
+section() {
+  echo ""
+  echo "=================================================="
+  echo "$*"
+  echo "=================================================="
 }
 
-# ── Scenarios ─────────────────────────────────────────────────────────────────
-case "$CHOICE" in
+PYTHON_BIN="python3"
+MODE=""
+MIMIC_DIR=""
+INSTALL_DEPS=0
 
-    # ── 1: Quick demo — baseline comparison only ──────────────────────────────
-    1)
-        echo ""
-        print_status "Scenario 1: Quick demo — baseline comparison only (<2 min)"
-        python3 src/run_integrated_solution.py \
-            --mode train-eval \
-            --n-synthetic-patients 200 \
-            --trajectory-length 20 \
-            --output-dir outputs/quick_demo
-        ;;
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-    # ── 2: Baseline + CQL ─────────────────────────────────────────────────────
-    2)
-        echo ""
-        print_status "Scenario 2: Baseline comparison + real CQL training (~10 min)"
-        python3 src/run_integrated_solution.py \
-            --mode train-eval \
-            --n-synthetic-patients 500 \
-            --trajectory-length 30 \
-            --train-cql \
-            --cql-iterations 5000 \
-            --cql-batch-size 256 \
-            --output-dir outputs/cql_only
-        ;;
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./quick_start.sh
+  ./quick_start.sh --mode <name_or_number>
+  ./quick_start.sh --mode smoke
+  ./quick_start.sh --mode resume-check
+  ./quick_start.sh --mode synthetic-fast
+  ./quick_start.sh --mode synthetic-medium
+  ./quick_start.sh --mode synthetic-full
+  ./quick_start.sh --mode mimic-sample --mimic-dir /path/to/mimic
+  ./quick_start.sh --mode mimic-full --mimic-dir /path/to/mimic
+  ./quick_start.sh --mode defense
+  ./quick_start.sh --mode regression-pack
 
-    # ── 3: Encoder + CQL ──────────────────────────────────────────────────────
-    3)
-        echo ""
-        print_status "Scenario 3: State encoder pre-training + CQL (~20 min)"
-        python3 src/run_integrated_solution.py \
-            --mode train-eval \
-            --n-synthetic-patients 500 \
-            --trajectory-length 30 \
-            --use-encoder \
-            --encoder-state-dim 64 \
-            --encoder-epochs 50 \
-            --encoder-type autoencoder \
-            --train-cql \
-            --cql-iterations 10000 \
-            --output-dir outputs/enc_cql
-        ;;
+Options:
+  --mode <value>         Scenario mode name or numeric alias
+  --mimic-dir <path>     MIMIC-III CSV directory (optional; prompts if missing for mimic modes)
+  --install-deps         Install dependencies from requirements.txt
+  --help, -h             Show this help
 
-    # ── 4: Extended state — vitals + med-history ──────────────────────────────
-    4)
-        echo ""
-        print_status "Scenario 4: Extended 16-dim state — vitals + med-history (~20 min)"
-        print_info "Adds heart_rate, sbp, respiratory_rate, spo2, adherence_rate_7d, medication_count"
-        python3 src/run_integrated_solution.py \
-            --mode train-eval \
-            --n-synthetic-patients 500 \
-            --trajectory-length 30 \
-            --use-vitals \
-            --use-med-history \
-            --use-encoder \
-            --encoder-state-dim 64 \
-            --encoder-epochs 50 \
-            --train-cql \
-            --cql-iterations 10000 \
-            --output-dir outputs/extended_state
-        ;;
+Named modes:
+  smoke
+  resume-check
+  synthetic-fast
+  synthetic-medium
+  synthetic-full
+  mimic-sample
+  mimic-full
+  defense
+  regression-pack
 
-    # ── 5: Full pipeline — all modules ────────────────────────────────────────
-    5)
-        echo ""
-        print_status "Scenario 5: Full pipeline — encoder + CQL + interpretability + transfer (~60 min)"
-        python3 src/run_integrated_solution.py \
-            --mode train-eval \
-            --n-synthetic-patients 1000 \
-            --trajectory-length 30 \
-            --use-encoder \
-            --encoder-state-dim 64 \
-            --encoder-epochs 50 \
-            --train-cql \
-            --cql-iterations 10000 \
-            --cql-batch-size 256 \
-            --use-interpretability \
-            --n-counterfactuals 5 \
-            --tree-max-depth 4 \
-            --explain-n-samples 100 \
-            --use-transfer \
-            --transfer-steps 1000 \
-            --output-dir outputs/full_run
-        ;;
+Backward-compatible numeric aliases:
+  1 -> smoke
+  2 -> synthetic-cql
+  3 -> synthetic-encoder-cql
+  4 -> synthetic-extended-state
+  5 -> synthetic-full
+  6 -> mimic-sample
+  7 -> mimic-full
+  8 -> defense
+USAGE
+}
 
-    # ── 6: MIMIC-III sample ───────────────────────────────────────────────────
-    6)
-        echo ""
-        print_warning "Requires MIMIC-III data — see docs/MIMIC_DOWNLOAD_GUIDE.md"
-        read -p "Path to MIMIC-III CSV directory: " MIMIC_DIR
-        check_mimic_dir "$MIMIC_DIR"
-        print_status "Scenario 6: MIMIC-III 100-patient sample pipeline (~30 min)"
-        python3 src/run_integrated_solution.py \
-            --mode train-eval \
-            --mimic-dir "$MIMIC_DIR" \
-            --use-sample \
-            --sample-size 100 \
-            --train-cql \
-            --cql-iterations 5000 \
-            --cql-batch-size 256 \
-            --output-dir outputs/mimic_sample
-        ;;
-
-    # ── 7: MIMIC-III full pipeline ────────────────────────────────────────────
-    7)
-        echo ""
-        print_warning "Requires MIMIC-III data — see docs/MIMIC_DOWNLOAD_GUIDE.md"
-        print_warning "CHARTEVENTS.csv (~35 GB) is needed for --use-vitals"
-        read -p "Path to MIMIC-III CSV directory: " MIMIC_DIR
-        check_mimic_dir "$MIMIC_DIR"
-
-        # Auto-detect CHARTEVENTS for --use-vitals
-        VITALS_FLAG=""
-        if [ -f "$MIMIC_DIR/CHARTEVENTS.csv" ]; then
-            print_status "CHARTEVENTS.csv found — enabling vital signs (HR, SBP, RR, SpO2)"
-            VITALS_FLAG="--use-vitals"
-        else
-            print_warning "CHARTEVENTS.csv not found — vital signs disabled"
-            print_info "Download CHARTEVENTS.csv and re-run to enable --use-vitals"
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode)
+        if [[ $# -lt 2 ]]; then
+          err "--mode requires a value"
+          exit 1
         fi
-
-        print_status "Scenario 7: Full MIMIC-III pipeline"
-        python3 src/run_integrated_solution.py \
-            --mode train-eval \
-            --mimic-dir "$MIMIC_DIR" \
-            $VITALS_FLAG \
-            --use-med-history \
-            --use-encoder \
-            --encoder-state-dim 64 \
-            --encoder-epochs 50 \
-            --train-cql \
-            --cql-iterations 20000 \
-            --cql-batch-size 256 \
-            --use-interpretability \
-            --n-counterfactuals 5 \
-            --explain-n-samples 100 \
-            --use-transfer \
-            --transfer-steps 1000 \
-            --output-dir outputs/mimic_full
+        MODE="$2"
+        shift 2
         ;;
-
-    # ── 8: Defense bundle ─────────────────────────────────────────────────────
-    8)
-        echo ""
-        print_status "Scenario 8: Thesis defense bundle (~2-5 min CPU)"
-        RUN_ID="defense_$(date +%Y%m%d_%H%M%S)"
-        python3 src/run_integrated_solution.py \
-            --defense-bundle \
-            --run-id "$RUN_ID" \
-            --seed 42
+      --mimic-dir)
+        if [[ $# -lt 2 ]]; then
+          err "--mimic-dir requires a value"
+          exit 1
+        fi
+        MIMIC_DIR="$2"
+        shift 2
         ;;
-
-    *)
-        print_error "Invalid choice: $CHOICE"
-        echo "Run  ./quick_start.sh --help  to see available scenarios"
+      --install-deps)
+        INSTALL_DEPS=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        err "Unknown argument: $1"
+        usage
         exit 1
         ;;
-esac
+    esac
+  done
+}
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-echo ""
-echo "=========================================="
-print_status "Pipeline complete!"
-echo "=========================================="
-echo ""
-echo "Generated artifacts (outputs/<run_dir>/):"
-echo "  results_summary.json           all metrics and module results"
-echo "  baseline_comparison_report.md  per-baseline metric table"
-echo "  baseline_comparison_report.json  machine-readable metrics"
-echo "  baseline_comparison.png        reward + safety rate bar chart"
-echo "  policy_dashboard.png           4-panel policy dashboard"
-echo "  comparison.png                 multi-policy reward comparison"
-echo "  health_metrics.png             time-in-range and safety index"
-echo "  safety_clinical_heatmap.png    safety + clinical compliance heatmap"
-echo "  results_table.tex              LaTeX table for thesis"
-echo "  outputs/defense_<timestamp>/   full defense artifact bundle tree  (--mode 8)"
-echo ""
-echo "Optional artifacts (present when matching flags were used):"
-echo "  cql_training_curves.png        CQL loss/return curves    (--train-cql)"
-echo "  feature_importance.png         decision tree importances  (--use-interpretability)"
-echo "  personalization_score.png      PDF §7.2 score card        (--use-encoder --use-interpretability)"
-echo "  counterfactuals.json           counterfactual explanations (--use-interpretability)"
-echo "  decision_rules.txt / .json     if-then rules              (--use-interpretability)"
-echo "  transfer_adapter.pt            adapter weights            (--use-transfer)"
-echo ""
+normalize_mode() {
+  local raw="$1"
+  case "$raw" in
+    1) echo "smoke" ;;
+    2) echo "synthetic-cql" ;;
+    3) echo "synthetic-encoder-cql" ;;
+    4) echo "synthetic-extended-state" ;;
+    5) echo "synthetic-full" ;;
+    6) echo "mimic-sample" ;;
+    7) echo "mimic-full" ;;
+    8) echo "defense" ;;
+    *) echo "$raw" ;;
+  esac
+}
+
+pick_python() {
+  if [[ -x "./venv/bin/python" ]]; then
+    PYTHON_BIN="./venv/bin/python"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  else
+    err "python3 not found"
+    exit 1
+  fi
+}
+
+check_project_root() {
+  if [[ ! -f "src/run_integrated_solution.py" ]]; then
+    err "Run this script from the project root (missing src/run_integrated_solution.py)"
+    exit 1
+  fi
+  if [[ ! -f "requirements.txt" ]]; then
+    err "requirements.txt not found"
+    exit 1
+  fi
+}
+
+install_dependencies_if_requested() {
+  if [[ "$INSTALL_DEPS" -eq 1 ]]; then
+    section "Installing Dependencies"
+    "$PYTHON_BIN" -m pip install -r requirements.txt
+    status "Dependencies installed"
+  fi
+}
+
+check_runtime_deps() {
+  local dep_check
+  dep_check="$($PYTHON_BIN - <<'PY'
+import importlib
+mods = ["numpy", "pandas", "torch", "matplotlib", "sklearn"]
+missing = [m for m in mods if importlib.util.find_spec(m) is None]
+print(",".join(missing))
+PY
+)"
+  if [[ -n "$dep_check" ]]; then
+    err "Missing Python dependencies: $dep_check"
+    info "Run: ./quick_start.sh --install-deps --mode <mode>"
+    exit 1
+  fi
+  status "Runtime dependencies look available"
+}
+
+print_device_info() {
+  "$PYTHON_BIN" - <<'PY'
+import torch
+if torch.backends.mps.is_available():
+    print("[INFO] Device: MPS (Apple Silicon)")
+elif torch.cuda.is_available():
+    print("[INFO] Device: CUDA")
+else:
+    print("[INFO] Device: CPU")
+PY
+}
+
+run_cmd() {
+  local cmd=("$@")
+  info "Running command:"
+  printf '  '
+  printf '%q ' "${cmd[@]}"
+  echo ""
+  "${cmd[@]}"
+}
+
+require_path() {
+  local p="$1"
+  local label="$2"
+  if [[ ! -e "$p" ]]; then
+    err "$label missing: $p"
+    return 1
+  fi
+  return 0
+}
+
+check_mimic_dir() {
+  local dir="$1"
+  if [[ -z "$dir" ]]; then
+    err "MIMIC directory is empty"
+    return 1
+  fi
+  if [[ ! -d "$dir" ]]; then
+    err "Directory not found: $dir"
+    return 1
+  fi
+
+  local required=(PATIENTS.csv ADMISSIONS.csv DIAGNOSES_ICD.csv LABEVENTS.csv PRESCRIPTIONS.csv)
+  local missing=()
+  local f
+  for f in "${required[@]}"; do
+    if [[ ! -f "$dir/$f" ]]; then
+      missing+=("$f")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Missing required MIMIC files in $dir: ${missing[*]}"
+    info "See docs/MIMIC_DOWNLOAD_GUIDE.md"
+    return 1
+  fi
+  status "MIMIC directory validated: $dir"
+}
+
+resolve_mimic_dir() {
+  if [[ -n "$MIMIC_DIR" ]]; then
+    check_mimic_dir "$MIMIC_DIR" || exit 1
+    return
+  fi
+  read -r -p "Path to MIMIC-III CSV directory: " MIMIC_DIR
+  check_mimic_dir "$MIMIC_DIR" || exit 1
+}
+
+print_scenario_summary() {
+  local scenario="$1"
+  local out_dir="$2"
+  section "Scenario Complete: $scenario"
+  info "Output dir: $out_dir"
+  info "Checkpoint dir: $out_dir/checkpoints"
+
+  if [[ -f "$out_dir/RUN_PROVENANCE.json" ]]; then
+    status "Provenance: $out_dir/RUN_PROVENANCE.json"
+  else
+    warn "Provenance not found: $out_dir/RUN_PROVENANCE.json"
+  fi
+
+  if [[ -f "$out_dir/results_summary.json" ]]; then
+    status "Summary: $out_dir/results_summary.json"
+  fi
+  if [[ -f "$out_dir/MASTER_RESULTS.csv" ]]; then
+    status "Master results: $out_dir/MASTER_RESULTS.csv"
+  fi
+}
+
+validate_smoke_outputs() {
+  local out_dir="$1"
+  require_path "$out_dir" "Smoke output directory" || exit 1
+  require_path "$out_dir/checkpoints" "Smoke checkpoint directory" || exit 1
+  require_path "$out_dir/RUN_PROVENANCE.json" "Smoke provenance file" || exit 1
+  status "Smoke validation checks passed"
+}
+
+run_smoke() {
+  local out_dir="outputs/smoke_test"
+  section "Scenario: smoke"
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --mode train-eval \
+    --use-synthetic \
+    --n-synthetic-patients 40 \
+    --trajectory-length 8 \
+    --fast-eval \
+    --max-eval-samples 200 \
+    --skip-slow-baselines \
+    --light-report \
+    --output-dir "$out_dir"
+
+  validate_smoke_outputs "$out_dir"
+  print_scenario_summary "smoke" "$out_dir"
+}
+
+run_resume_check() {
+  local out_dir="outputs/smoke_test"
+  section "Scenario: resume-check"
+  info "Step 1/2: initial smoke run"
+  run_smoke
+
+  info "Step 2/2: rerun smoke with --resume"
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --mode train-eval \
+    --use-synthetic \
+    --n-synthetic-patients 40 \
+    --trajectory-length 8 \
+    --fast-eval \
+    --max-eval-samples 200 \
+    --skip-slow-baselines \
+    --light-report \
+    --resume \
+    --output-dir "$out_dir"
+
+  validate_smoke_outputs "$out_dir"
+  status "Resume path exercised successfully"
+  print_scenario_summary "resume-check" "$out_dir"
+}
+
+run_synthetic_fast() {
+  local out_dir="outputs/synthetic_fast"
+  section "Scenario: synthetic-fast"
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --mode train-eval \
+    --use-synthetic \
+    --n-synthetic-patients 120 \
+    --trajectory-length 12 \
+    --fast-eval \
+    --max-eval-samples 1000 \
+    --skip-slow-baselines \
+    --light-report \
+    --output-dir "$out_dir"
+  print_scenario_summary "synthetic-fast" "$out_dir"
+}
+
+run_synthetic_medium() {
+  local out_dir="outputs/synthetic_medium"
+  section "Scenario: synthetic-medium"
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --mode train-eval \
+    --use-synthetic \
+    --n-synthetic-patients 400 \
+    --trajectory-length 20 \
+    --use-encoder \
+    --encoder-state-dim 64 \
+    --encoder-epochs 30 \
+    --train-cql \
+    --cql-iterations 3000 \
+    --cql-batch-size 256 \
+    --fast-eval \
+    --max-eval-samples 3000 \
+    --output-dir "$out_dir"
+  print_scenario_summary "synthetic-medium" "$out_dir"
+}
+
+run_synthetic_full() {
+  local out_dir="outputs/synthetic_full"
+  section "Scenario: synthetic-full"
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --mode train-eval \
+    --use-synthetic \
+    --n-synthetic-patients 1000 \
+    --trajectory-length 30 \
+    --use-encoder \
+    --encoder-state-dim 64 \
+    --encoder-epochs 50 \
+    --train-cql \
+    --cql-iterations 10000 \
+    --cql-batch-size 256 \
+    --use-interpretability \
+    --n-counterfactuals 5 \
+    --tree-max-depth 4 \
+    --explain-n-samples 100 \
+    --use-transfer \
+    --transfer-steps 1000 \
+    --output-dir "$out_dir"
+  print_scenario_summary "synthetic-full" "$out_dir"
+}
+
+run_synthetic_cql() {
+  local out_dir="outputs/cql_only"
+  section "Scenario: synthetic-cql"
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --mode train-eval \
+    --use-synthetic \
+    --n-synthetic-patients 500 \
+    --trajectory-length 30 \
+    --train-cql \
+    --cql-iterations 5000 \
+    --cql-batch-size 256 \
+    --output-dir "$out_dir"
+  print_scenario_summary "synthetic-cql" "$out_dir"
+}
+
+run_synthetic_encoder_cql() {
+  local out_dir="outputs/enc_cql"
+  section "Scenario: synthetic-encoder-cql"
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --mode train-eval \
+    --use-synthetic \
+    --n-synthetic-patients 500 \
+    --trajectory-length 30 \
+    --use-encoder \
+    --encoder-state-dim 64 \
+    --encoder-epochs 50 \
+    --encoder-type autoencoder \
+    --train-cql \
+    --cql-iterations 10000 \
+    --output-dir "$out_dir"
+  print_scenario_summary "synthetic-encoder-cql" "$out_dir"
+}
+
+run_synthetic_extended_state() {
+  local out_dir="outputs/extended_state"
+  section "Scenario: synthetic-extended-state"
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --mode train-eval \
+    --use-synthetic \
+    --n-synthetic-patients 500 \
+    --trajectory-length 30 \
+    --use-vitals \
+    --use-med-history \
+    --use-encoder \
+    --encoder-state-dim 64 \
+    --encoder-epochs 50 \
+    --train-cql \
+    --cql-iterations 10000 \
+    --output-dir "$out_dir"
+  print_scenario_summary "synthetic-extended-state" "$out_dir"
+}
+
+run_mimic_sample() {
+  local out_dir="outputs/mimic_sample"
+  section "Scenario: mimic-sample"
+  resolve_mimic_dir
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --mode train-eval \
+    --mimic-dir "$MIMIC_DIR" \
+    --use-sample \
+    --sample-size 100 \
+    --train-cql \
+    --cql-iterations 5000 \
+    --cql-batch-size 256 \
+    --output-dir "$out_dir"
+  print_scenario_summary "mimic-sample" "$out_dir"
+}
+
+run_mimic_full() {
+  local out_dir="outputs/mimic_full"
+  section "Scenario: mimic-full"
+  resolve_mimic_dir
+
+  local vitals_flag=()
+  if [[ -f "$MIMIC_DIR/CHARTEVENTS.csv" ]]; then
+    status "CHARTEVENTS.csv detected: enabling --use-vitals"
+    vitals_flag=(--use-vitals)
+  else
+    warn "CHARTEVENTS.csv not found: vitals disabled"
+  fi
+
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --mode train-eval \
+    --mimic-dir "$MIMIC_DIR" \
+    "${vitals_flag[@]}" \
+    --use-med-history \
+    --use-encoder \
+    --encoder-state-dim 64 \
+    --encoder-epochs 50 \
+    --train-cql \
+    --cql-iterations 20000 \
+    --cql-batch-size 256 \
+    --use-interpretability \
+    --n-counterfactuals 5 \
+    --explain-n-samples 100 \
+    --use-transfer \
+    --transfer-steps 1000 \
+    --output-dir "$out_dir"
+  print_scenario_summary "mimic-full" "$out_dir"
+}
+
+run_defense() {
+  section "Scenario: defense"
+  local run_id="defense_$(date +%Y%m%d_%H%M%S)"
+  run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
+    --defense-bundle \
+    --run-id "$run_id" \
+    --seed 42
+
+  local out_dir="outputs/$run_id"
+  print_scenario_summary "defense" "$out_dir"
+}
+
+run_regression_pack() {
+  section "Scenario: regression-pack"
+  info "Step 1/4: smoke"
+  run_smoke
+  info "Step 2/4: resume-check"
+  run_resume_check
+  info "Step 3/4: synthetic-fast"
+  run_synthetic_fast
+  info "Step 4/4: defense"
+  run_defense
+  status "Regression pack completed successfully"
+}
+
+interactive_menu() {
+  section "RL Healthcare Treatment — Scenario Runner"
+  cat <<'MENU'
+Select a run scenario:
+
+  Core scenarios
+  1) smoke
+  2) synthetic-cql
+  3) synthetic-encoder-cql
+  4) synthetic-extended-state
+  5) synthetic-full
+  6) mimic-sample
+  7) mimic-full
+  8) defense
+
+  Additional scenarios
+  9) resume-check
+ 10) synthetic-fast
+ 11) synthetic-medium
+ 12) regression-pack
+MENU
+  echo ""
+  read -r -p "Enter choice (1-12): " MODE
+  case "$MODE" in
+    9) MODE="resume-check" ;;
+    10) MODE="synthetic-fast" ;;
+    11) MODE="synthetic-medium" ;;
+    12) MODE="regression-pack" ;;
+    *) MODE="$(normalize_mode "$MODE")" ;;
+  esac
+}
+
+dispatch_mode() {
+  local m="$1"
+  case "$m" in
+    smoke) run_smoke ;;
+    resume-check) run_resume_check ;;
+    synthetic-fast) run_synthetic_fast ;;
+    synthetic-medium) run_synthetic_medium ;;
+    synthetic-full) run_synthetic_full ;;
+    synthetic-cql) run_synthetic_cql ;;
+    synthetic-encoder-cql) run_synthetic_encoder_cql ;;
+    synthetic-extended-state) run_synthetic_extended_state ;;
+    mimic-sample) run_mimic_sample ;;
+    mimic-full) run_mimic_full ;;
+    defense) run_defense ;;
+    regression-pack) run_regression_pack ;;
+    *)
+      err "Unknown mode: $m"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main() {
+  parse_args "$@"
+  pick_python
+  check_project_root
+  install_dependencies_if_requested
+  check_runtime_deps
+  print_device_info
+
+  if [[ -z "$MODE" ]]; then
+    interactive_menu
+  else
+    MODE="$(normalize_mode "$MODE")"
+  fi
+
+  dispatch_mode "$MODE"
+}
+
+main "$@"
