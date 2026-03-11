@@ -15,8 +15,8 @@ import yaml
 
 
 class ArtifactManager:
-    def __init__(self, base_output: Path, run_id: str):
-        self.run_root = base_output / run_id
+    def __init__(self, base_output: Path, run_id: str, run_root: Path | None = None):
+        self.run_root = run_root if run_root is not None else (base_output / run_id)
         self.dirs = {
             'meta': self.run_root / '00_metadata',
             'data': self.run_root / '01_data_summary',

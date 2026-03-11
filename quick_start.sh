@@ -253,8 +253,9 @@ resolve_mimic_dir() {
 print_scenario_summary() {
   local scenario="$1"
   local requested_out_dir="$2"
+  local allow_legacy_fallback="${3:-0}"
   local out_dir
-  out_dir="$(resolve_output_dir "$requested_out_dir")"
+  out_dir="$(resolve_output_dir "$requested_out_dir" "$allow_legacy_fallback")"
   section "Scenario Complete: $scenario"
   if [[ "$out_dir" != "$requested_out_dir" ]]; then
     info "Requested output dir: $requested_out_dir"
@@ -278,17 +279,20 @@ print_scenario_summary() {
 
 resolve_output_dir() {
   local requested="$1"
+  local allow_legacy_fallback="${2:-0}"
   if [[ -d "$requested" ]]; then
     echo "$requested"
     return
   fi
-  if [[ -d "${requested}_synthetic" ]]; then
-    echo "${requested}_synthetic"
-    return
-  fi
-  if [[ -d "${requested}_mimic" ]]; then
-    echo "${requested}_mimic"
-    return
+  if [[ "$allow_legacy_fallback" == "1" ]]; then
+    if [[ -d "${requested}_synthetic" ]]; then
+      echo "${requested}_synthetic"
+      return
+    fi
+    if [[ -d "${requested}_mimic" ]]; then
+      echo "${requested}_mimic"
+      return
+    fi
   fi
   echo "$requested"
 }
@@ -510,13 +514,33 @@ run_mimic_full() {
 run_defense() {
   section "Scenario: defense"
   local run_id="defense_$(date +%Y%m%d_%H%M%S)"
+  local out_dir="outputs/$run_id"
   run_cmd "$PYTHON_BIN" src/run_integrated_solution.py \
     --defense-bundle \
     --run-id "$run_id" \
+    --output-dir "$out_dir" \
     --seed 42
 
-  local out_dir="outputs/$run_id"
+  validate_defense_outputs "$out_dir"
   print_scenario_summary "defense" "$out_dir"
+}
+
+validate_defense_outputs() {
+  local out_dir="$1"
+  local synthetic_alt="${out_dir}_synthetic"
+  local mimic_alt="${out_dir}_mimic"
+  require_path "$out_dir" "Defense output directory" || exit 1
+  if [[ -d "$synthetic_alt" || -d "$mimic_alt" ]]; then
+    err "Duplicate defense output directories detected for run: $out_dir"
+    if [[ -d "$synthetic_alt" ]]; then
+      err "Unexpected sibling directory: $synthetic_alt"
+    fi
+    if [[ -d "$mimic_alt" ]]; then
+      err "Unexpected sibling directory: $mimic_alt"
+    fi
+    exit 1
+  fi
+  status "Defense output directory validation passed"
 }
 
 run_regression_pack() {

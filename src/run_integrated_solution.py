@@ -832,28 +832,26 @@ class IntegratedSolutionRunner:
         (self.output_dir / 'ROOT_CAUSE_REPORT.md').write_text("\n".join(report) + "\n")
 
     def _normalize_output_dir_by_data_source(self) -> None:
-        """Ensure folder naming reflects the actual data source."""
+        """Warn on source/name mismatch without mutating requested output path."""
         source = self.results.get('data', {}).get('source', '').lower()
+        if not source:
+            return
         cur_name = self.output_dir.name
         cur_lower = cur_name.lower()
-        new_name = None
+        mismatch = False
         if source == 'synthetic':
             if 'mimic' in cur_lower:
-                new_name = cur_name.lower().replace('mimic', 'synthetic')
+                mismatch = True
             elif 'synthetic' not in cur_lower:
-                new_name = f"{cur_name}_synthetic"
+                mismatch = True
         elif source == 'mimic':
             if 'synthetic' in cur_lower:
-                new_name = cur_name.lower().replace('synthetic', 'mimic')
-        if new_name:
-            new_dir = self.output_dir.parent / new_name
-            new_dir.mkdir(parents=True, exist_ok=True)
+                mismatch = True
+        if mismatch:
             logger.warning(
-                "Output directory name '%s' mismatches source '%s'. Using '%s' instead.",
-                self.output_dir.name, source, new_dir,
+                "Output directory name '%s' mismatches source '%s'. Continuing with requested path '%s'.",
+                self.output_dir.name, source, self.output_dir,
             )
-            self.output_dir = new_dir
-            self._clear_previous_run_artifacts()
 
     def run_full_pipeline(self):
         """Run complete end-to-end pipeline."""
@@ -907,8 +905,7 @@ class IntegratedSolutionRunner:
     def run_defense_bundle(self):
         """Generate complete thesis defense artifacts bundle."""
         run_id = getattr(self.config, 'run_id', datetime.now().strftime('defense_%Y%m%d_%H%M%S'))
-        base_output = Path('outputs')
-        am = ArtifactManager(base_output, run_id)
+        am = ArtifactManager(self.output_dir.parent, run_id, run_root=self.output_dir)
 
         # fast deterministic settings
         self.config.mode = 'synthetic'
@@ -918,7 +915,6 @@ class IntegratedSolutionRunner:
         self.config.train_iql = True
         self.config.train_cql = False
         self.config.iql_updates = min(getattr(self.config, 'iql_updates', 300), 300)
-        self.output_dir = am.run_root
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Run core pipeline stages
@@ -1061,8 +1057,8 @@ class IntegratedSolutionRunner:
         fig_idx = build_figures_index()
         am.write_final_reports(defense_md, one_page, fig_idx)
 
-        self.results['defense_bundle_dir'] = str(am.run_root)
-        logger.info(f"DEFENSE BUNDLE READY: {am.run_root}")
+        self.results['defense_bundle_dir'] = str(self.output_dir)
+        logger.info(f"DEFENSE BUNDLE READY: {self.output_dir}")
         return self.results
 
     # ------------------------------------------------------------------
@@ -4122,7 +4118,7 @@ def parse_arguments():
     parser.add_argument('--iql-updates', type=int, default=400, help='Number of IQL updates')
     parser.add_argument('--demo', action='store_true', help='Run deterministic quick CPU demo')
     parser.add_argument('--defense-bundle', action='store_true', help='Generate full thesis defense artifact bundle')
-    parser.add_argument('--run-id', type=str, default=None, help='Custom run id for outputs/<run_id>')
+    parser.add_argument('--run-id', type=str, default=None, help='Custom run identifier (metadata only unless used in --output-dir)')
     parser.add_argument('--seed', type=int, default=42, help='Global deterministic seed')
     parser.add_argument('--run-distillation', action='store_true', default=True, help='Run policy distillation step')
 
@@ -4174,6 +4170,7 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+    default_output_dir = 'outputs/integration_run'
     if args.defense_bundle:
         args.mode = 'synthetic'
         args.use_synthetic = True
@@ -4181,6 +4178,8 @@ def main():
         args.train_cql = False
         if not args.run_id:
             args.run_id = datetime.now().strftime('defense_%Y%m%d_%H%M%S')
+        if args.output_dir == default_output_dir:
+            args.output_dir = f'outputs/{args.run_id}'
     if args.demo:
         args.mode = 'synthetic'
         args.use_synthetic = True
