@@ -6,6 +6,16 @@ Comprehensive evaluation tools for offline RL in healthcare settings.
 
 from configs.config import EvaluationConfig
 from .off_policy_eval import OffPolicyEvaluator, Trajectory, OPEResult
+from .off_policy_evaluation import (
+    BehaviorPolicy,
+    WISEstimator,
+    DMEstimator,
+    DREstimator,
+    OPERunner,
+    load_cql_checkpoint,
+    load_encoder,
+    print_summary_table,
+)
 from .safety_metrics import SafetyEvaluator, SafetyResult
 from .clinical_metrics import ClinicalEvaluator, ClinicalResult
 from .performance_metrics import PerformanceEvaluator, PerformanceResult
@@ -33,6 +43,15 @@ __all__ = [
     'SafetyResult',
     'ClinicalResult',
     'PerformanceResult',
+    # Standalone OPE estimators
+    'BehaviorPolicy',
+    'WISEstimator',
+    'DMEstimator',
+    'DREstimator',
+    'OPERunner',
+    'load_cql_checkpoint',
+    'load_encoder',
+    'print_summary_table',
     # Interpretability
     'InterpretabilityConfig',
     'CounterfactualExplainer',
