@@ -1923,7 +1923,9 @@ class IntegratedSolutionRunner:
         eval_policies = dict(self.results['baselines']['policies'])
         if 'iql' in self.results and self.results['iql'].get('agent') is not None:
             eval_policies['IQL'] = self.results['iql']['agent']
-
+        if 'cql' in self.results and self.results['cql'].get('agent') is not None:
+            eval_policies['CQL'] = self.results['cql']['agent']
+            
         # Per-policy rollouts used as source of truth for reward/safety summaries.
         # Reuse Stage 3 rollout only when full evaluation signature matches.
         baseline_rollout = self.results.get('baseline_rollouts')
@@ -2601,6 +2603,15 @@ class IntegratedSolutionRunner:
         return np.array([0.0], dtype=np.float32), np.array([1.0], dtype=np.float32)
 
     def _safe_policy_action(self, policy, state: np.ndarray) -> Tuple[float, float]:
+        # If the policy was trained on encoded states, encode the raw state before inference.
+        expected_dim = getattr(policy, 'state_dim', None)
+        if expected_dim is not None and state.reshape(-1).shape[0] != expected_dim:
+            encoder_wrapper = self.results.get('encoder_wrapper')
+            if encoder_wrapper is not None:
+                try:
+                    state = np.asarray(encoder_wrapper.encode_state(state), dtype=np.float32).reshape(-1)
+                except Exception:
+                    pass
         raw_action = policy.select_action(state, deterministic=True)
         raw_scalar = float(np.asarray(raw_action, dtype=np.float32).reshape(-1)[0])
         low, high = self._action_bounds_for_policy(policy)
