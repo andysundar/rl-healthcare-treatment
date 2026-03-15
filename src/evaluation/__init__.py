@@ -6,7 +6,12 @@ Comprehensive evaluation tools for offline RL in healthcare settings.
 
 from configs.config import EvaluationConfig
 from .off_policy_eval import OffPolicyEvaluator, Trajectory, OPEResult
-from .safety_metrics import SafetyEvaluator, SafetyResult
+from .safety_metrics import (
+    SafetyEvaluator,
+    SafetyResult,
+    compute_safety_index,
+    generate_safety_report,
+)
 from .clinical_metrics import ClinicalEvaluator, ClinicalResult
 from .performance_metrics import PerformanceEvaluator, PerformanceResult
 from .comparison import PolicyComparator
@@ -31,6 +36,8 @@ __all__ = [
     'Trajectory',
     'OPEResult',
     'SafetyResult',
+    'compute_safety_index',
+    'generate_safety_report',
     'ClinicalResult',
     'PerformanceResult',
     # Interpretability
